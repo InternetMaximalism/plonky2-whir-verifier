@@ -7,3 +7,4 @@ via_ir = true
 evm_version = "prague"
 optimizer = true
 optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./" }]
