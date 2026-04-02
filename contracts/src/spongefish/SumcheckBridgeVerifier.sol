@@ -140,6 +140,115 @@ library SumcheckBridgeVerifier {
         );
     }
 
+    /// @notice Derive Plonky2 challenges on-chain via Keccak.
+    ///         Matches Rust: keccak256("plonky2-keccak-challenges" || transcript || public_inputs_LE)
+    ///         then sequential squeeze for betas, gammas, alphas, zeta.
+    /// @param transcript The WHIR transcript bytes (proof_narg)
+    /// @param publicInputs Public input field elements (Goldilocks u64)
+    /// @param numChallenges Number of challenge values per category
+    /// @return betas Challenge values for permutation
+    /// @return gammas Challenge values for permutation
+    /// @return alphas Challenge values for constraint reduction
+    /// @return zetaC0 Ext2 zeta component 0
+    /// @return zetaC1 Ext2 zeta component 1
+    function deriveKeccakChallenges(
+        bytes memory transcript,
+        uint256[] memory publicInputs,
+        uint256 numChallenges
+    ) internal pure returns (
+        uint256[] memory betas,
+        uint256[] memory gammas,
+        uint256[] memory alphas,
+        uint256 zetaC0,
+        uint256 zetaC1
+    ) {
+        // Initial hash: keccak256("plonky2-keccak-challenges" || transcript || PI_LE_bytes)
+        bytes memory initData = abi.encodePacked("plonky2-keccak-challenges", transcript);
+        for (uint256 i = 0; i < publicInputs.length; i++) {
+            initData = abi.encodePacked(initData, _u64ToLeBytes(uint64(publicInputs[i])));
+        }
+        bytes32 state = keccak256(initData);
+
+        // Squeeze: each call hashes current state, updates state, extracts LE u64 % GL_P
+        betas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            betas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        gammas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            gammas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        alphas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            alphas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC0 = _leU64(uint256(state) >> 192) % GL_P;
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC1 = _leU64(uint256(state) >> 192) % GL_P;
+    }
+
+    /// @notice Verify polynomial decomposition: P(ζ) = Σ batch_i(ζ) · ζ^offset_i
+    ///         This binds individual batch evaluations to the committed polynomial.
+    /// @param claimedSum The proven P(ζ_sumcheck) from sumcheck
+    /// @param batchSizes Sizes of each polynomial batch [d_const, d_wires, d_zs, d_quot]
+    /// @param zeta The sumcheck evaluation point ζ (Ext3)
+    /// @param batchEvals Evaluations of each batch at ζ [const(ζ), wires(ζ), zs(ζ), quot(ζ)]
+    function verifyDecomposition(
+        GoldilocksExt3.Ext3 memory claimedSum,
+        uint256[] memory batchSizes,
+        GoldilocksExt3.Ext3 memory zeta,
+        GoldilocksExt3.Ext3[] memory batchEvals
+    ) internal pure {
+        require(batchSizes.length == batchEvals.length, "batch count mismatch");
+
+        // P(ζ) = batch_0(ζ) + ζ^d0 · batch_1(ζ) + ζ^(d0+d1) · batch_2(ζ) + ...
+        GoldilocksExt3.Ext3 memory recomputed = batchEvals[0];
+        uint256 offset = batchSizes[0];
+        for (uint256 i = 1; i < batchEvals.length; i++) {
+            // ζ^offset via repeated squaring
+            GoldilocksExt3.Ext3 memory zetaPow = _ext3Pow(zeta, offset);
+            recomputed = recomputed.add(zetaPow.mul(batchEvals[i]));
+            offset += batchSizes[i];
+        }
+
+        require(
+            recomputed.c0 == claimedSum.c0 &&
+            recomputed.c1 == claimedSum.c1 &&
+            recomputed.c2 == claimedSum.c2,
+            "decomposition: P(zeta) != sum of batch evals"
+        );
+    }
+
+    /// @dev Compute a^n for Ext3 via binary exponentiation.
+    function _ext3Pow(GoldilocksExt3.Ext3 memory base, uint256 exp)
+        private pure returns (GoldilocksExt3.Ext3 memory result)
+    {
+        result = GoldilocksExt3.one();
+        GoldilocksExt3.Ext3 memory b = base;
+        while (exp > 0) {
+            if (exp & 1 == 1) {
+                result = result.mul(b);
+            }
+            b = b.square();
+            exp >>= 1;
+        }
+    }
+
+    /// @dev Encode a uint64 as 8 little-endian bytes.
+    function _u64ToLeBytes(uint64 val) private pure returns (bytes memory) {
+        bytes memory out = new bytes(8);
+        _writeU64LE(out, 0, val);
+        return out;
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------

@@ -172,6 +172,11 @@ pub struct WhirPlonky2Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F 
     /// Each batch is already padded to a power of 2 by `polys_to_whir_field`.
     pub batch_sizes: Vec<usize>,
 
+    /// Evaluations of each batch polynomial at sumcheck.zeta (Ext3).
+    /// Used for on-chain decomposition check: P(ζ) = Σ batch_i(ζ) · ζ^offset_i.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub batch_evals_at_zeta: Vec<Field64_3>,
+
     /// Public input: `true` = validity proof, `false` = fraud proof.
     /// This is bound into the WHIR proof's Fiat-Shamir transcript.
     pub expected_result: bool,
@@ -736,10 +741,30 @@ where
     // Assemble proof
     // -----------------------------------------------------------------------
 
+    // Compute batch evaluations at sumcheck.zeta for on-chain decomposition check.
+    // Each batch is evaluated independently as a univariate polynomial at zeta.
+    // P(ζ) = batch_0(ζ) + ζ^|batch_0| · batch_1(ζ) + ζ^(|batch_0|+|batch_1|) · batch_2(ζ) + ...
+    let batch_evals_at_zeta = if let Some(zeta) = combined_whir.zeta {
+        // Re-extract batch polynomials (they were consumed by concat_batches)
+        let b0 = polys_to_whir_field(&circuit_data.prover_only.constants_sigmas_commitment.polynomials);
+        let b1 = polys_to_whir_field(&polys.wires);
+        let b2 = polys_to_whir_field(&polys.zs_partial_products);
+        let b3 = polys_to_whir_field(&polys.quotient_chunks);
+        vec![
+            sumcheck::eval_univariate_via_mle(&b0, zeta),
+            sumcheck::eval_univariate_via_mle(&b1, zeta),
+            sumcheck::eval_univariate_via_mle(&b2, zeta),
+            sumcheck::eval_univariate_via_mle(&b3, zeta),
+        ]
+    } else {
+        vec![]
+    };
+
     let proof = WhirPlonky2Proof {
         standard_proof,
         combined_whir,
         batch_sizes,
+        batch_evals_at_zeta,
         expected_result,
     };
 
@@ -1081,8 +1106,7 @@ where
     C::InnerHasher: Hasher<F>,
 {
     use plonky2::field::types::PrimeField64;
-    use plonky2::iop::challenger::Challenger;
-    use plonky2::hash::hash_types::RichField as _;
+    use ark_ff::PrimeField as ArkPrimeField;
 
     let openings = &proof.standard_proof.proof.openings;
     let common = &circuit_data.common;
@@ -1102,29 +1126,50 @@ where
         }).collect()
     };
 
-    // Re-derive Fiat-Shamir challenges (same as Plonky2's verifier)
+    // Derive Plonky2 challenges via Keccak (unified with WHIR transcript).
+    // This replaces Poseidon-based Plonky2 Challenger so challenges can be
+    // re-derived on-chain from the WHIR transcript bytes.
+    //
+    // Binding: the WHIR transcript encodes the Merkle commitment to all polynomials.
+    // Challenges derived from keccak(transcript) are therefore bound to the commitment.
     let num_challenges = common.config.num_challenges;
-    let public_inputs_hash = C::InnerHasher::hash_no_pad(&proof.standard_proof.public_inputs);
 
-    let mut challenger = Challenger::<F, C::Hasher>::new();
-    challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
-    challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.wires_cap);
+    let keccak_challenges = {
+        use sha3::{Digest, Keccak256};
 
-    let betas = challenger.get_n_challenges(num_challenges);
-    let gammas = challenger.get_n_challenges(num_challenges);
+        // Goldilocks prime: 2^64 - 2^32 + 1
+        const GL_P: u64 = 0xFFFFFFFF00000001u64;
 
-    // Skip lookup challenges if no lookups
-    if !common.luts.is_empty() {
-        let num_lookup_challenges = 4 * num_challenges; // NUM_COINS_LOOKUP * num_challenges
-        let _deltas = challenger.get_n_challenges(num_lookup_challenges - 2 * num_challenges);
-    }
+        // Base material: WHIR transcript bytes (contains Merkle root)
+        let transcript_bytes = &proof.combined_whir.proof_narg;
+        let mut h = Keccak256::new();
+        h.update(b"plonky2-keccak-challenges");
+        h.update(transcript_bytes);
+        // Also bind to public inputs
+        for &pi in &proof.standard_proof.public_inputs {
+            h.update(&pi.to_canonical_u64().to_le_bytes());
+        }
 
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.plonk_zs_partial_products_cap);
-    let alphas = challenger.get_n_challenges(num_challenges);
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.quotient_polys_cap);
-    let zeta = challenger.get_extension_challenge::<D>();
-    let (zeta_c0, zeta_c1) = ext_to_pair(&zeta);
+        // Squeeze challenges in sequence: betas, gammas, alphas, zeta
+        // Using a running Keccak state (same pattern as sumcheck)
+        let mut state = h.finalize().to_vec();
+
+        let mut squeeze_u64 = || -> u64 {
+            let mut h2 = Keccak256::new();
+            h2.update(&state);
+            state = h2.finalize().to_vec();
+            let val = u64::from_le_bytes(state[0..8].try_into().unwrap());
+            val % GL_P
+        };
+
+        let betas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let gammas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let alphas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let zeta_c0 = squeeze_u64();
+        let zeta_c1 = squeeze_u64();
+        (betas, gammas, alphas, zeta_c0, zeta_c1)
+    };
+    let (keccak_betas, keccak_gammas, keccak_alphas, zeta_c0, zeta_c1) = keccak_challenges;
 
     // Circuit params
     let selectors_info = &common.selectors_info;
@@ -1159,9 +1204,9 @@ where
             "quotientPolys": ext_vec_to_flat(&openings.quotient_polys),
         },
         "challenges": {
-            "plonkBetas": betas.iter().map(|b| b.to_canonical_u64()).collect::<Vec<_>>(),
-            "plonkGammas": gammas.iter().map(|g| g.to_canonical_u64()).collect::<Vec<_>>(),
-            "plonkAlphas": alphas.iter().map(|a| a.to_canonical_u64()).collect::<Vec<_>>(),
+            "plonkBetas": keccak_betas,
+            "plonkGammas": keccak_gammas,
+            "plonkAlphas": keccak_alphas,
             "plonkZeta": [zeta_c0, zeta_c1],
         },
         "circuitParams": {
@@ -1181,6 +1226,15 @@ where
         "publicInputs": proof.standard_proof.public_inputs.iter()
             .map(|f| f.to_canonical_u64())
             .collect::<Vec<_>>(),
+        "batchSizes": proof.batch_sizes,
+        "batchEvalsAtZeta": proof.batch_evals_at_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 

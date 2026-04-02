@@ -37,27 +37,41 @@ contract GenericE2ETest is Test, Plonky2Verifier {
     // =====================================================================
 
     function test_full_e2e() public {
-        // WHIR
+        string memory whirJson = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        string memory constraintJson = vm.readFile("test/data/test_constraint_data.json");
+
+        // 1. WHIR polynomial commitment verification
         {
-            string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
             uint256 gasBefore = gasleft();
-            _verifyWhirCommitment(json);
+            _verifyWhirCommitment(whirJson);
             console.log("WHIR combined gas:", gasBefore - gasleft());
         }
 
-        // Sumcheck bridge — binding between WHIR commitment and constraint openings
+        // 2. Sumcheck bridge — binding between WHIR commitment and constraint openings
         {
-            string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
             uint256 gasBefore = gasleft();
-            _verifySumcheckBridge(json);
+            _verifySumcheckBridge(whirJson);
             console.log("Sumcheck bridge gas:", gasBefore - gasleft());
         }
 
-        // Plonky2 constraints
+        // 3. On-chain challenge re-derivation (Keccak)
         {
-            string memory json = vm.readFile("test/data/test_constraint_data.json");
             uint256 gasBefore = gasleft();
-            _verifyPlonky2Constraints(json);
+            _verifyChallengeDerivation(whirJson, constraintJson);
+            console.log("Challenge derivation gas:", gasBefore - gasleft());
+        }
+
+        // 4. Opening decomposition check
+        {
+            uint256 gasBefore = gasleft();
+            _verifyDecomposition(whirJson, constraintJson);
+            console.log("Decomposition gas:", gasBefore - gasleft());
+        }
+
+        // 5. Plonky2 constraints
+        {
+            uint256 gasBefore = gasleft();
+            _verifyPlonky2Constraints(constraintJson);
             console.log("Plonky2 constraints gas:", gasBefore - gasleft());
         }
     }
@@ -69,6 +83,18 @@ contract GenericE2ETest is Test, Plonky2Verifier {
     function test_sumcheck_bridge() public view {
         string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
         _verifySumcheckBridge(json);
+    }
+
+    function test_challenge_derivation() public view {
+        string memory whirJson = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        string memory constraintJson = vm.readFile("test/data/test_constraint_data.json");
+        _verifyChallengeDerivation(whirJson, constraintJson);
+    }
+
+    function test_decomposition() public view {
+        string memory whirJson = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        string memory constraintJson = vm.readFile("test/data/test_constraint_data.json");
+        _verifyDecomposition(whirJson, constraintJson);
     }
 
     /// @notice Negative test: tampered claimed_sum must fail
@@ -205,6 +231,77 @@ contract GenericE2ETest is Test, Plonky2Verifier {
 
         // Verify binding: f(r) · h_ζ(r) == finalClaim
         SumcheckBridgeVerifier.verifyBinding(whirEvalAtR, hZetaAtR, finalClaim);
+    }
+
+    // =====================================================================
+    // Internal: Challenge re-derivation (Issue 1 fix)
+    // =====================================================================
+
+    function _verifyChallengeDerivation(string memory whirJson, string memory constraintJson) internal pure {
+        bytes memory transcript = vm.parseJsonBytes(whirJson, ".transcript");
+        uint256[] memory publicInputs = abi.decode(vm.parseJson(constraintJson, ".publicInputs"), (uint256[]));
+        uint256 numChallenges = _u(constraintJson, ".circuitParams.numChallenges");
+
+        // Derive challenges on-chain
+        (
+            uint256[] memory betas,
+            uint256[] memory gammas,
+            uint256[] memory alphas,
+            uint256 zetaC0,
+            uint256 zetaC1
+        ) = SumcheckBridgeVerifier.deriveKeccakChallenges(transcript, publicInputs, numChallenges);
+
+        // Compare with fixture values
+        uint256[] memory expectedBetas = abi.decode(vm.parseJson(constraintJson, ".challenges.plonkBetas"), (uint256[]));
+        uint256[] memory expectedGammas = abi.decode(vm.parseJson(constraintJson, ".challenges.plonkGammas"), (uint256[]));
+        uint256[] memory expectedAlphas = abi.decode(vm.parseJson(constraintJson, ".challenges.plonkAlphas"), (uint256[]));
+        uint256[] memory expectedZeta = abi.decode(vm.parseJson(constraintJson, ".challenges.plonkZeta"), (uint256[]));
+
+        for (uint256 i = 0; i < numChallenges; i++) {
+            require(betas[i] == expectedBetas[i], "beta mismatch");
+            require(gammas[i] == expectedGammas[i], "gamma mismatch");
+            require(alphas[i] == expectedAlphas[i], "alpha mismatch");
+        }
+        require(zetaC0 == expectedZeta[0], "zeta.c0 mismatch");
+        require(zetaC1 == expectedZeta[1], "zeta.c1 mismatch");
+    }
+
+    // =====================================================================
+    // Internal: Decomposition check (Issue 2 fix)
+    // =====================================================================
+
+    function _verifyDecomposition(string memory whirJson, string memory constraintJson) internal pure {
+        // Get claimed_sum from sumcheck
+        GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(whirJson, ".sumcheck.claimed_sum.c0")),
+            uint64(_u(whirJson, ".sumcheck.claimed_sum.c1")),
+            uint64(_u(whirJson, ".sumcheck.claimed_sum.c2"))
+        );
+
+        // Get sumcheck zeta
+        GoldilocksExt3.Ext3 memory zeta = GoldilocksExt3.Ext3(
+            uint64(_u(whirJson, ".sumcheck.zeta.c0")),
+            uint64(_u(whirJson, ".sumcheck.zeta.c1")),
+            uint64(_u(whirJson, ".sumcheck.zeta.c2"))
+        );
+
+        // Get batch sizes
+        uint256[] memory batchSizes = abi.decode(vm.parseJson(constraintJson, ".batchSizes"), (uint256[]));
+
+        // Get batch evaluations at sumcheck.zeta
+        uint256 nBatches = batchSizes.length;
+        GoldilocksExt3.Ext3[] memory batchEvals = new GoldilocksExt3.Ext3[](nBatches);
+        for (uint256 i = 0; i < nBatches; i++) {
+            string memory prefix = string.concat(".batchEvalsAtZeta[", vm.toString(i), "].");
+            batchEvals[i] = GoldilocksExt3.Ext3(
+                uint64(_u(constraintJson, string.concat(prefix, "c0"))),
+                uint64(_u(constraintJson, string.concat(prefix, "c1"))),
+                uint64(_u(constraintJson, string.concat(prefix, "c2")))
+            );
+        }
+
+        // Verify: P(ζ) = Σ batch_i(ζ) · ζ^offset_i
+        SumcheckBridgeVerifier.verifyDecomposition(claimedSum, batchSizes, zeta, batchEvals);
     }
 
     // =====================================================================
