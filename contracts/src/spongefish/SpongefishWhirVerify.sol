@@ -47,6 +47,10 @@ library SpongefishWhirVerify {
         uint256 initialNumVariables;
         uint256 initialCosetSize;
         uint256 initialNumCosets;
+        // Evaluation point (for FinalClaim).
+        // If empty, uses canonical point (1, 2, ..., numVariables).
+        // With sumcheck bridge, this is the sumcheck-derived point r.
+        GoldilocksExt3.Ext3[] evaluationPoint;
         // Per-round params (array of length numRounds)
         RoundParams[] rounds;
     }
@@ -399,10 +403,18 @@ library SpongefishWhirVerify {
             }
         }
 
-        // expectedRlc = mleEvaluateEqCanonical(...) * initialLinearFormRlcSum
-        GoldilocksExt3.Ext3 memory eqVal = WhirLinearAlgebra.mleEvaluateEqCanonical(
-            params.numVariables, vs.allFoldingRandomness
-        );
+        // expectedRlc = eq(evaluationPoint, foldingRandomness) * initialLinearFormRlcSum
+        // Use actual evaluation point if provided, otherwise canonical (1, 2, ..., n)
+        GoldilocksExt3.Ext3 memory eqVal;
+        if (params.evaluationPoint.length > 0) {
+            eqVal = WhirLinearAlgebra.mleEvaluateEq(
+                params.evaluationPoint, vs.allFoldingRandomness
+            );
+        } else {
+            eqVal = WhirLinearAlgebra.mleEvaluateEqCanonical(
+                params.numVariables, vs.allFoldingRandomness
+            );
+        }
         // Multiply in-place
         assembly {
             let p := 0xFFFFFFFF00000001

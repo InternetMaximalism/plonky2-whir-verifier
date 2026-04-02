@@ -211,6 +211,19 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         p.initialCosetSize = _u(json, ".whir_params.initial_coset_size");
         p.initialNumCosets = _u(json, ".whir_params.initial_num_cosets");
 
+        // Load evaluation point (sumcheck-derived r, or empty for canonical)
+        {
+            uint256 nv = p.numVariables;
+            p.evaluationPoint = new GoldilocksExt3.Ext3[](nv);
+            for (uint256 i = 0; i < nv; i++) {
+                string memory epPrefix = string.concat(".evaluation_point[", vm.toString(i), "].");
+                uint64 c0 = uint64(_u(json, string.concat(epPrefix, "c0")));
+                uint64 c1 = uint64(_u(json, string.concat(epPrefix, "c1")));
+                uint64 c2 = uint64(_u(json, string.concat(epPrefix, "c2")));
+                p.evaluationPoint[i] = GoldilocksExt3.Ext3(c0, c1, c2);
+            }
+        }
+
         p.rounds = new SpongefishWhirVerify.RoundParams[](p.numRounds);
         for (uint256 i = 0; i < p.numRounds; i++) {
             string memory prefix = string.concat(".whir_params.rounds[", vm.toString(i), "].");

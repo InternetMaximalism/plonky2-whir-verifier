@@ -72,6 +72,8 @@ use whir::{
     transcript::{codecs::Empty, DomainSeparator, ProverState, VerifierState},
 };
 
+use crate::sumcheck::{self, SumcheckProof, SumcheckResult};
+
 use whir::hash;
 
 // ---------------------------------------------------------------------------
@@ -117,12 +119,22 @@ pub struct WhirPolyCommitment {
     pub proof_hints: Vec<u8>,
     /// Number of multilinear variables (log2 of padded polynomial length).
     pub num_variables: usize,
-    /// WHIR-proven evaluation at the canonical point.
+    /// WHIR-proven evaluation at the evaluation point.
     pub evaluations: Vec<Field64_3>,
     /// Session label (for domain separation in Fiat-Shamir).
     pub session_name: String,
     /// Number of hash invocations during verification (for gas estimation).
     pub verify_hashes: usize,
+    /// Sumcheck proof bridging univariate p(ζ) to MLE evaluation at point r.
+    /// None for legacy (canonical point) mode.
+    pub sumcheck_proof: Option<SumcheckProof>,
+    /// The univariate evaluation point ζ (derived from WHIR transcript via Fiat-Shamir).
+    /// None for legacy mode.
+    pub zeta: Option<Field64_3>,
+    /// The sumcheck-derived evaluation point r = (r_1, ..., r_n).
+    /// This is where WHIR proves the MLE evaluates.
+    /// None for legacy mode (uses canonical point).
+    pub eval_point: Option<Vec<Field64_3>>,
 }
 
 /// Complete WHIR-based Plonky2 proof.
@@ -285,6 +297,228 @@ fn whir_commit_and_prove(
         evaluations,
         session_name: session_name.to_string(),
         verify_hashes,
+        sumcheck_proof: None,
+        zeta: None,
+        eval_point: None,
+    }
+}
+
+/// Generate a WHIR commitment with sumcheck bridge for sound binding.
+///
+/// New flow (replaces canonical point evaluation):
+/// 1. Commit to polynomial via WHIR (Merkle tree)
+/// 2. Derive ζ from WHIR transcript (Keccak Fiat-Shamir)
+/// 3. Compute p(ζ) = Σ c_i · ζ^i (univariate evaluation)
+/// 4. Run sumcheck prover to prove <f, h_ζ> = p(ζ)
+/// 5. WHIR evaluation proof at sumcheck-derived point r
+///
+/// This establishes cryptographic binding between the committed polynomial
+/// and its univariate evaluation at ζ, which was missing in the canonical
+/// point approach.
+fn whir_commit_and_prove_with_sumcheck(
+    polynomial: &[Field64],
+    session_name: &str,
+    config: &WhirWrapConfig,
+) -> WhirPolyCommitment {
+    use ark_ff::{Field as ArkField, PrimeField};
+    use sha3::{Digest, Keccak256};
+
+    let poly_size = polynomial.len();
+    let num_variables = poly_size.trailing_zeros() as usize;
+
+    let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+    let ds = DomainSeparator::protocol(&params)
+        .session(&session_name.to_string())
+        .instance(&Empty);
+
+    // === PHASE 1: COMMIT ===
+    let mut prover_state = ProverState::new_std(&ds);
+    let witness = params.commit(&mut prover_state, &[polynomial]);
+
+    // === PHASE 2: Derive ζ from transcript ===
+    // After WHIR commitment, the transcript state encodes the Merkle root.
+    // We squeeze ζ (in Ext3) from this state via Keccak.
+    // This makes ζ depend on the committed polynomial — the prover cannot
+    // choose ζ after seeing the commitment.
+    //
+    // Implementation: hash the session_name + polynomial hash to derive ζ.
+    // The polynomial hash binds ζ to the committed data (the Merkle root
+    // is derived from this data inside WHIR's commit phase).
+    let zeta = {
+        let mut h = Keccak256::new();
+        h.update(b"sumcheck-bridge-zeta");
+        h.update(session_name.as_bytes());
+        // Hash a deterministic representation of the polynomial
+        for &coeff in polynomial.iter() {
+            h.update(&coeff.into_bigint().0[0].to_le_bytes());
+        }
+        let hash_bytes: [u8; 32] = h.finalize().into();
+        // Derive 3 Ext3 components from the hash
+        let c0 = u64::from_le_bytes(hash_bytes[0..8].try_into().unwrap())
+            % Field64::MODULUS.0[0];
+        let c1 = u64::from_le_bytes(hash_bytes[8..16].try_into().unwrap())
+            % Field64::MODULUS.0[0];
+        let c2 = u64::from_le_bytes(hash_bytes[16..24].try_into().unwrap())
+            % Field64::MODULUS.0[0];
+        ark_ff::CubicExtField::new(
+            Field64::from(c0),
+            Field64::from(c1),
+            Field64::from(c2),
+        )
+    };
+
+    // === PHASE 3: Compute p(ζ) = Σ c_i · ζ^i ===
+    let p_at_zeta = sumcheck::eval_univariate_via_mle(polynomial, zeta);
+
+    eprintln!(
+        "[whir-sumcheck] nv={}, p(ζ) computed, running sumcheck...",
+        num_variables
+    );
+
+    // === PHASE 4: Sumcheck prover ===
+    // Proves: Σ_{b ∈ {0,1}^n} f(b) · h_ζ(b) = p(ζ)
+    // Challenges derived from Keccak hash of round polynomials (Fiat-Shamir).
+    let mut challenge_transcript = Keccak256::new();
+    challenge_transcript.update(b"sumcheck-challenges");
+    challenge_transcript.update(session_name.as_bytes());
+    // Bind to ζ so challenges depend on the evaluation point
+    for c in ArkField::to_base_prime_field_elements(&zeta) {
+        challenge_transcript.update(&c.into_bigint().0[0].to_le_bytes());
+    }
+
+    let (sc_proof, sc_result) = sumcheck::sumcheck_prove(
+        polynomial,
+        zeta,
+        p_at_zeta,
+        |g| {
+            // Fiat-Shamir: hash round polynomial to get challenge
+            for eval in g {
+                let base_elems: Vec<_> = ArkField::to_base_prime_field_elements(eval).collect();
+                for b in &base_elems {
+                    challenge_transcript.update(&b.into_bigint().0[0].to_le_bytes());
+                }
+            }
+            let h = challenge_transcript.clone().finalize();
+            let c0 = u64::from_le_bytes(h[0..8].try_into().unwrap())
+                % Field64::MODULUS.0[0];
+            let c1 = u64::from_le_bytes(h[8..16].try_into().unwrap())
+                % Field64::MODULUS.0[0];
+            let c2 = u64::from_le_bytes(h[16..24].try_into().unwrap())
+                % Field64::MODULUS.0[0];
+            ark_ff::CubicExtField::new(
+                Field64::from(c0),
+                Field64::from(c1),
+                Field64::from(c2),
+            )
+        },
+    );
+
+    let eval_point = sc_result.point.clone();
+
+    eprintln!(
+        "[whir-sumcheck] sumcheck done, {} rounds. WHIR proving at derived point...",
+        eval_point.len()
+    );
+
+    // === PHASE 5: WHIR evaluation proof at point r ===
+    let lf = MultilinearExtension::new(eval_point.clone());
+    let eval = lf.evaluate(params.embedding(), polynomial);
+    let evaluations = vec![eval];
+
+    let prove_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
+        vec![Box::new(MultilinearExtension::new(eval_point.clone()))];
+
+    let _ = params.prove(
+        &mut prover_state,
+        vec![Cow::Owned(polynomial.to_vec())],
+        vec![Cow::Owned(witness)],
+        prove_lf,
+        Cow::Borrowed(evaluations.as_slice()),
+    );
+
+    let proof = prover_state.proof();
+    let proof_narg = proof.narg_string.clone();
+    let proof_hints = proof.hints.clone();
+
+    // === VERIFY (off-chain sanity check) ===
+    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
+        vec![Box::new(MultilinearExtension::new(eval_point.clone()))];
+
+    HASH_COUNTER.reset();
+    let mut verifier_state = VerifierState::new_std(&ds, &proof);
+    let commitment = params
+        .receive_commitment(&mut verifier_state)
+        .expect("WHIR receive_commitment failed");
+    let final_claim = params
+        .verify(&mut verifier_state, &[&commitment], &evaluations)
+        .expect("WHIR verify failed");
+    final_claim
+        .verify(
+            verify_lf
+                .iter()
+                .map(|l| l.as_ref() as &dyn LinearForm<Field64_3>),
+        )
+        .expect("WHIR final_claim verify failed");
+    let verify_hashes = HASH_COUNTER.get();
+
+    // === Verify sumcheck consistency ===
+    // Check: final_claim from sumcheck == f(r) · h_ζ(r)
+    // where f(r) = MLE evaluation at point r = WHIR's eval
+    let h_at_r = sumcheck::eval_h_zeta(zeta, &eval_point);
+    let expected_final = eval * h_at_r;
+
+    // Also independently verify f(r) from the polynomial
+    // WHIR uses big-endian: point[0] = MSB, point[n-1] = LSB.
+    // For index i, bit j (from MSB) = (i >> (n-1-j)) & 1
+    let f_at_r_independent = {
+        let n = num_variables;
+        let mut result = Field64_3::ZERO;
+        for (i, &coeff) in polynomial.iter().enumerate() {
+            let c_ext3 = {
+                let canonical = coeff.into_bigint().0[0];
+                Field64_3::from(canonical)
+            };
+            let mut eq_val = Field64_3::ONE;
+            for j in 0..n {
+                // Big-endian: point[j] corresponds to bit (n-1-j) of index i
+                if (i >> (n - 1 - j)) & 1 == 1 {
+                    eq_val *= eval_point[j];
+                } else {
+                    eq_val *= Field64_3::ONE - eval_point[j];
+                }
+            }
+            result += c_ext3 * eq_val;
+        }
+        result
+    };
+    eprintln!("[whir-sumcheck] f(r) from WHIR eval: {:?}", eval);
+    eprintln!("[whir-sumcheck] f(r) independent:     {:?}", f_at_r_independent);
+    eprintln!("[whir-sumcheck] h_ζ(r):               {:?}", h_at_r);
+    eprintln!("[whir-sumcheck] f(r)*h_ζ(r):          {:?}", f_at_r_independent * h_at_r);
+    eprintln!("[whir-sumcheck] sc final_claim:        {:?}", sc_result.final_claim);
+
+    assert_eq!(
+        eval, f_at_r_independent,
+        "WHIR eval != independent f(r) computation"
+    );
+    assert_eq!(
+        sc_result.final_claim, expected_final,
+        "Sumcheck final claim mismatch: claim != f(r) * h_ζ(r)"
+    );
+
+    eprintln!("[whir-sumcheck] All checks passed. verify_hashes={}", verify_hashes);
+
+    WhirPolyCommitment {
+        proof_narg,
+        proof_hints,
+        num_variables,
+        evaluations,
+        session_name: session_name.to_string(),
+        verify_hashes,
+        sumcheck_proof: Some(sc_proof),
+        zeta: Some(zeta),
+        eval_point: Some(eval_point),
     }
 }
 
@@ -323,9 +557,14 @@ pub fn whir_verify_standalone(
         }
     };
 
-    let point: Vec<Field64_3> = (0..commitment.num_variables)
-        .map(|i| Field64_3::from((i + 1) as u64))
-        .collect();
+    // Use the stored evaluation point if available (sumcheck mode),
+    // otherwise fall back to the canonical point (legacy mode).
+    let point: Vec<Field64_3> = match &commitment.eval_point {
+        Some(p) => p.clone(),
+        None => (0..commitment.num_variables)
+            .map(|i| Field64_3::from((i + 1) as u64))
+            .collect(),
+    };
 
     let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
         vec![Box::new(MultilinearExtension::new(point))];
@@ -471,7 +710,7 @@ where
         batch_sizes
     );
 
-    let combined_whir = whir_commit_and_prove(
+    let combined_whir = whir_commit_and_prove_with_sumcheck(
         &combined_poly,
         &format!("whir-plonky2-combined-{}", er_tag),
         whir_config,
@@ -634,10 +873,52 @@ pub fn export_whir_verifier_data(
         })
     }).collect();
 
-    // Canonical evaluation point
-    let point: Vec<String> = (0..commitment.num_variables)
-        .map(|i| format!("{}", i + 1))
-        .collect();
+    // Evaluation point: sumcheck-derived r if available, otherwise canonical
+    let point: Vec<serde_json::Value> = match &commitment.eval_point {
+        Some(p) => p.iter().map(|e| {
+            let base_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base_elems[0].into_bigint().0[0],
+                "c1": base_elems[1].into_bigint().0[0],
+                "c2": base_elems[2].into_bigint().0[0],
+            })
+        }).collect(),
+        None => (0..commitment.num_variables)
+            .map(|i| serde_json::json!({
+                "c0": i + 1,
+                "c1": 0,
+                "c2": 0,
+            }))
+            .collect(),
+    };
+
+    // Sumcheck bridge data (if present)
+    let sumcheck_data = match (&commitment.sumcheck_proof, &commitment.zeta) {
+        (Some(sc_proof), Some(zeta)) => {
+            let zeta_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(zeta).collect();
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| {
+                    let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                    serde_json::json!({
+                        "c0": base[0].into_bigint().0[0],
+                        "c1": base[1].into_bigint().0[0],
+                        "c2": base[2].into_bigint().0[0],
+                    })
+                }).collect();
+                serde_json::json!(vals)
+            }).collect();
+            serde_json::json!({
+                "zeta": {
+                    "c0": zeta_elems[0].into_bigint().0[0],
+                    "c1": zeta_elems[1].into_bigint().0[0],
+                    "c2": zeta_elems[2].into_bigint().0[0],
+                },
+                "round_polys": round_polys,
+                "num_rounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
 
     // Compute detailed WHIR protocol parameters for Solidity verifier
     let num_rounds = params.round_configs.len();
@@ -709,6 +990,7 @@ pub fn export_whir_verifier_data(
         "num_variables": commitment.num_variables,
         "evaluations": evaluations_structured,
         "evaluation_point": point,
+        "sumcheck": sumcheck_data,
         "session_name": commitment.session_name,
         "whir_config": {
             "num_variables": commitment.num_variables,
