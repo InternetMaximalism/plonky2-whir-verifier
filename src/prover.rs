@@ -90,11 +90,20 @@ pub struct WhirWrapConfig {
 
 impl WhirWrapConfig {
     /// Default configuration optimized for on-chain Keccak verification.
+    /// Uses 80-bit security (standard for L2/on-chain applications).
     pub fn default_keccak() -> Self {
+        Self::with_security_level(80)
+    }
+
+    /// Configuration with custom security level.
+    /// - 80: standard for on-chain (smaller proofs, fewer queries)
+    /// - 100: conservative (larger proofs, more queries)
+    /// - 128: high security (largest proofs)
+    pub fn with_security_level(security_level: usize) -> Self {
         Self {
-            name: "keccak-rate2".to_string(),
+            name: format!("keccak-rate2-sec{}", security_level),
             params: ProtocolParameters {
-                security_level: 100,
+                security_level,
                 pow_bits: 0,
                 initial_folding_factor: 4,
                 folding_factor: 4,

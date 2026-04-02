@@ -120,9 +120,26 @@ library GoldilocksExt3 {
         }
     }
 
-    /// @dev Square an element (uses mul for now — can be specialized later)
-    function square(Ext3 memory a) internal pure returns (Ext3 memory) {
-        return mul(a, a);
+    /// @dev Square an element. Specialized formula: 6 mulmod vs 9 in mul().
+    ///   c0 = a0^2 + 4*a1*a2       (NONRESIDUE=2, so 2*2=4)
+    ///   c1 = 2*a0*a1 + 2*a2^2
+    ///   c2 = 2*a0*a2 + a1^2
+    function square(Ext3 memory a) internal pure returns (Ext3 memory r) {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let a0 := mload(a)
+            let a1 := mload(add(a, 0x20))
+            let a2 := mload(add(a, 0x40))
+
+            // c0 = a0^2 + 4*a1*a2
+            mstore(r, addmod(mulmod(a0, a0, p), mulmod(4, mulmod(a1, a2, p), p), p))
+
+            // c1 = 2*a0*a1 + 2*a2^2
+            mstore(add(r, 0x20), addmod(mulmod(2, mulmod(a0, a1, p), p), mulmod(2, mulmod(a2, a2, p), p), p))
+
+            // c2 = 2*a0*a2 + a1^2
+            mstore(add(r, 0x40), addmod(mulmod(2, mulmod(a0, a2, p), p), mulmod(a1, a1, p), p))
+        }
     }
 
     /// @dev Multiplicative inverse in F_p[x] / (x^3 - 2).
