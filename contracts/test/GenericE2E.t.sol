@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {Test, console} from "forge-std/Test.sol";
 import {SpongefishWhirVerify} from "../src/spongefish/SpongefishWhirVerify.sol";
 import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
+import {SumcheckBridgeVerifier} from "../src/spongefish/SumcheckBridgeVerifier.sol";
 import {Plonky2Verifier} from "../src/Plonky2Verifier.sol";
 import {GoldilocksExt2} from "../src/GoldilocksField.sol";
 
@@ -44,6 +45,14 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             console.log("WHIR combined gas:", gasBefore - gasleft());
         }
 
+        // Sumcheck bridge — binding between WHIR commitment and constraint openings
+        {
+            string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+            uint256 gasBefore = gasleft();
+            _verifySumcheckBridge(json);
+            console.log("Sumcheck bridge gas:", gasBefore - gasleft());
+        }
+
         // Plonky2 constraints
         {
             string memory json = vm.readFile("test/data/test_constraint_data.json");
@@ -51,6 +60,151 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             _verifyPlonky2Constraints(json);
             console.log("Plonky2 constraints gas:", gasBefore - gasleft());
         }
+    }
+
+    // =====================================================================
+    // Standalone sumcheck bridge test
+    // =====================================================================
+
+    function test_sumcheck_bridge() public view {
+        string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        _verifySumcheckBridge(json);
+    }
+
+    /// @notice Negative test: tampered claimed_sum must fail
+    function test_sumcheck_bridge_tampered_claim() public view {
+        string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        uint256 numRounds = _u(json, ".sumcheck.num_rounds");
+        string memory sessionName = abi.decode(vm.parseJson(json, ".sumcheck.session_name"), (string));
+        GoldilocksExt3.Ext3 memory zeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.zeta.c0")),
+            uint64(_u(json, ".sumcheck.zeta.c1")),
+            uint64(_u(json, ".sumcheck.zeta.c2"))
+        );
+        // Tamper with claimed_sum: add 1 to c0
+        GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.claimed_sum.c0")) + 1,
+            uint64(_u(json, ".sumcheck.claimed_sum.c1")),
+            uint64(_u(json, ".sumcheck.claimed_sum.c2"))
+        );
+        GoldilocksExt3.Ext3[][] memory roundPolys = _parseSumcheckRoundPolys(json, numRounds);
+
+        bool reverted = false;
+        try this._externalVerifyBridge(numRounds, roundPolys, zeta, claimedSum, sessionName) {
+            // Should not reach here
+        } catch {
+            reverted = true;
+        }
+        assertTrue(reverted, "tampered claimed_sum must revert");
+    }
+
+    /// @notice Negative test: tampered round polynomial must fail binding
+    function test_sumcheck_bridge_tampered_roundpoly() public view {
+        string memory json = vm.readFile("test/data/whir/test_combined_verifier_data.json");
+        uint256 numRounds = _u(json, ".sumcheck.num_rounds");
+        string memory sessionName = abi.decode(vm.parseJson(json, ".sumcheck.session_name"), (string));
+        GoldilocksExt3.Ext3 memory zeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.zeta.c0")),
+            uint64(_u(json, ".sumcheck.zeta.c1")),
+            uint64(_u(json, ".sumcheck.zeta.c2"))
+        );
+        GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.claimed_sum.c0")),
+            uint64(_u(json, ".sumcheck.claimed_sum.c1")),
+            uint64(_u(json, ".sumcheck.claimed_sum.c2"))
+        );
+        GoldilocksExt3.Ext3[][] memory roundPolys = _parseSumcheckRoundPolys(json, numRounds);
+
+        // Tamper with g(2) in round 5
+        roundPolys[5][2].c0 += 1;
+
+        bool reverted = false;
+        try this._externalVerifyBridge(numRounds, roundPolys, zeta, claimedSum, sessionName) {
+            // Should not reach here
+        } catch {
+            reverted = true;
+        }
+        assertTrue(reverted, "tampered round polynomial must revert");
+    }
+
+    /// @dev External wrapper for try/catch (internal library calls can't be caught)
+    function _externalVerifyBridge(
+        uint256 numRounds,
+        GoldilocksExt3.Ext3[][] memory roundPolys,
+        GoldilocksExt3.Ext3 memory zeta,
+        GoldilocksExt3.Ext3 memory claimedSum,
+        string memory sessionName
+    ) external pure {
+        SumcheckBridgeVerifier.verify(numRounds, roundPolys, zeta, claimedSum, sessionName);
+    }
+
+    // =====================================================================
+    // Internal: Sumcheck bridge verification
+    // =====================================================================
+
+    function _verifySumcheckBridge(string memory json) internal pure {
+        // Parse sumcheck proof data
+        uint256 numRounds = _u(json, ".sumcheck.num_rounds");
+        string memory sessionName = abi.decode(vm.parseJson(json, ".sumcheck.session_name"), (string));
+
+        GoldilocksExt3.Ext3 memory zeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.zeta.c0")),
+            uint64(_u(json, ".sumcheck.zeta.c1")),
+            uint64(_u(json, ".sumcheck.zeta.c2"))
+        );
+
+        GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck.claimed_sum.c0")),
+            uint64(_u(json, ".sumcheck.claimed_sum.c1")),
+            uint64(_u(json, ".sumcheck.claimed_sum.c2"))
+        );
+
+        // Parse round polynomials
+        GoldilocksExt3.Ext3[][] memory roundPolys = new GoldilocksExt3.Ext3[][](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            roundPolys[i] = new GoldilocksExt3.Ext3[](3);
+            for (uint256 j = 0; j < 3; j++) {
+                string memory prefix = string.concat(
+                    ".sumcheck.round_polys[", vm.toString(i), "][", vm.toString(j), "]."
+                );
+                roundPolys[i][j] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
+        }
+
+        // Verify sumcheck: derive evalPoint and finalClaim
+        (
+            GoldilocksExt3.Ext3[] memory evalPoint,
+            GoldilocksExt3.Ext3 memory finalClaim
+        ) = SumcheckBridgeVerifier.verify(numRounds, roundPolys, zeta, claimedSum, sessionName);
+
+        // Verify that derived evalPoint matches the one passed to WHIR
+        for (uint256 i = 0; i < numRounds; i++) {
+            string memory epPrefix = string.concat(".evaluation_point[", vm.toString(i), "].");
+            uint64 ec0 = uint64(_u(json, string.concat(epPrefix, "c0")));
+            uint64 ec1 = uint64(_u(json, string.concat(epPrefix, "c1")));
+            uint64 ec2 = uint64(_u(json, string.concat(epPrefix, "c2")));
+            require(
+                evalPoint[i].c0 == ec0 && evalPoint[i].c1 == ec1 && evalPoint[i].c2 == ec2,
+                string.concat("evalPoint mismatch at round ", vm.toString(i))
+            );
+        }
+
+        // Compute h_ζ(r)
+        GoldilocksExt3.Ext3 memory hZetaAtR = SumcheckBridgeVerifier.computeHZeta(zeta, evalPoint);
+
+        // Get WHIR evaluation f(r) from fixture
+        GoldilocksExt3.Ext3 memory whirEvalAtR = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".evaluations[0].c0")),
+            uint64(_u(json, ".evaluations[0].c1")),
+            uint64(_u(json, ".evaluations[0].c2"))
+        );
+
+        // Verify binding: f(r) · h_ζ(r) == finalClaim
+        SumcheckBridgeVerifier.verifyBinding(whirEvalAtR, hZetaAtR, finalClaim);
     }
 
     // =====================================================================
@@ -181,6 +335,25 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             p.rounds[i].cosetSize = _u(json, string.concat(prefix, "coset_size"));
             p.rounds[i].numCosets = _u(json, string.concat(prefix, "num_cosets"));
             p.rounds[i].numVariables = _u(json, string.concat(prefix, "num_variables"));
+        }
+    }
+
+    function _parseSumcheckRoundPolys(string memory json, uint256 numRounds)
+        internal pure returns (GoldilocksExt3.Ext3[][] memory roundPolys)
+    {
+        roundPolys = new GoldilocksExt3.Ext3[][](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            roundPolys[i] = new GoldilocksExt3.Ext3[](3);
+            for (uint256 j = 0; j < 3; j++) {
+                string memory prefix = string.concat(
+                    ".sumcheck.round_polys[", vm.toString(i), "][", vm.toString(j), "]."
+                );
+                roundPolys[i][j] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
         }
     }
 

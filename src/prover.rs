@@ -144,6 +144,9 @@ pub struct WhirPolyCommitment {
     /// This is where WHIR proves the MLE evaluates.
     /// None for legacy mode (uses canonical point).
     pub eval_point: Option<Vec<Field64_3>>,
+    /// The claimed univariate evaluation p(ζ) = Σ c_i · ζ^i.
+    /// This is the sumcheck claimed sum. None for legacy mode.
+    pub claimed_sum: Option<Field64_3>,
 }
 
 /// Complete WHIR-based Plonky2 proof.
@@ -309,6 +312,7 @@ fn whir_commit_and_prove(
         sumcheck_proof: None,
         zeta: None,
         eval_point: None,
+        claimed_sum: None,
     }
 }
 
@@ -528,6 +532,7 @@ fn whir_commit_and_prove_with_sumcheck(
         sumcheck_proof: Some(sc_proof),
         zeta: Some(zeta),
         eval_point: Some(eval_point),
+        claimed_sum: Some(p_at_zeta),
     }
 }
 
@@ -902,9 +907,10 @@ pub fn export_whir_verifier_data(
     };
 
     // Sumcheck bridge data (if present)
-    let sumcheck_data = match (&commitment.sumcheck_proof, &commitment.zeta) {
-        (Some(sc_proof), Some(zeta)) => {
+    let sumcheck_data = match (&commitment.sumcheck_proof, &commitment.zeta, &commitment.claimed_sum) {
+        (Some(sc_proof), Some(zeta), Some(claimed_sum)) => {
             let zeta_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(zeta).collect();
+            let cs_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(claimed_sum).collect();
             let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
                 let vals: Vec<serde_json::Value> = g.iter().map(|e| {
                     let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
@@ -922,6 +928,12 @@ pub fn export_whir_verifier_data(
                     "c1": zeta_elems[1].into_bigint().0[0],
                     "c2": zeta_elems[2].into_bigint().0[0],
                 },
+                "claimed_sum": {
+                    "c0": cs_elems[0].into_bigint().0[0],
+                    "c1": cs_elems[1].into_bigint().0[0],
+                    "c2": cs_elems[2].into_bigint().0[0],
+                },
+                "session_name": commitment.session_name,
                 "round_polys": round_polys,
                 "num_rounds": sc_proof.round_polys.len(),
             })
