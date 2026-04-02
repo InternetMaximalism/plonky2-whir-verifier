@@ -19,6 +19,10 @@ hex = "0.4"
 num-bigint = "0.4"
 thiserror = "2"
 
+[[bin]]
+name = "generate_fixture"
+required-features = ["whir"]
+
 [features]
 default = ["whir"]
 whir = ["dep:whir", "dep:ark-ff", "dep:ark-std", "dep:sha3", "dep:ciborium"]
