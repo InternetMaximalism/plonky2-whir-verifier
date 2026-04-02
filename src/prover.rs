@@ -177,6 +177,13 @@ pub struct WhirPlonky2Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F 
     /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
     pub batch_evals_at_zeta: Vec<Field64_3>,
 
+    /// Per-polynomial Ext3 evaluations at ζ_sumcheck.
+    /// These replace the Ext2 openings from the standard Plonky2 proof.
+    /// Structure mirrors Plonky2's OpeningSet but in Ext3:
+    ///   constants, plonk_sigmas, wires, plonk_zs, plonk_zs_next,
+    ///   partial_products, quotient_polys
+    pub ext3_openings: Option<Ext3Openings>,
+
     /// Public input: `true` = validity proof, `false` = fraud proof.
     /// This is bound into the WHIR proof's Fiat-Shamir transcript.
     pub expected_result: bool,
@@ -191,6 +198,41 @@ pub struct WhirPlonky2ProveResult<F: RichField + Extendable<D>, C: GenericConfig
     pub whir_time: Duration,
     /// Total wall-clock time.
     pub total_time: Duration,
+}
+
+/// Per-polynomial evaluations at sumcheck.zeta (Ext3).
+/// Mirrors Plonky2's OpeningSet structure but in the cubic extension field.
+#[derive(Clone, Debug)]
+pub struct Ext3Openings {
+    pub constants: Vec<Field64_3>,
+    pub plonk_sigmas: Vec<Field64_3>,
+    pub wires: Vec<Field64_3>,
+    pub plonk_zs: Vec<Field64_3>,
+    pub plonk_zs_next: Vec<Field64_3>,
+    pub partial_products: Vec<Field64_3>,
+    pub quotient_polys: Vec<Field64_3>,
+}
+
+// ---------------------------------------------------------------------------
+// Polynomial evaluation in Ext3
+// ---------------------------------------------------------------------------
+
+/// Evaluate a single polynomial (with base field coefficients) at an Ext3 point.
+/// Uses Horner's method: p(z) = c_0 + z*(c_1 + z*(c_2 + ...))
+fn eval_poly_at_ext3<F: RichField>(poly: &PolynomialCoeffs<F>, z: Field64_3) -> Field64_3 {
+    let mut result = Field64_3::ZERO;
+    for c in poly.coeffs.iter().rev() {
+        result = result * z + sumcheck::base_to_ext3(Field64::from(c.to_canonical_u64()));
+    }
+    result
+}
+
+/// Evaluate each polynomial in a batch at an Ext3 point, returning per-polynomial evaluations.
+fn eval_polys_at_ext3<F: RichField>(
+    polys: &[PolynomialCoeffs<F>],
+    z: Field64_3,
+) -> Vec<Field64_3> {
+    polys.iter().map(|p| eval_poly_at_ext3(p, z)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -742,10 +784,7 @@ where
     // -----------------------------------------------------------------------
 
     // Compute batch evaluations at sumcheck.zeta for on-chain decomposition check.
-    // Each batch is evaluated independently as a univariate polynomial at zeta.
-    // P(ζ) = batch_0(ζ) + ζ^|batch_0| · batch_1(ζ) + ζ^(|batch_0|+|batch_1|) · batch_2(ζ) + ...
     let batch_evals_at_zeta = if let Some(zeta) = combined_whir.zeta {
-        // Re-extract batch polynomials (they were consumed by concat_batches)
         let b0 = polys_to_whir_field(&circuit_data.prover_only.constants_sigmas_commitment.polynomials);
         let b1 = polys_to_whir_field(&polys.wires);
         let b2 = polys_to_whir_field(&polys.zs_partial_products);
@@ -760,11 +799,54 @@ where
         vec![]
     };
 
+    // Compute per-polynomial Ext3 evaluations at ζ_sumcheck.
+    // These replace the Ext2 openings for on-chain constraint verification.
+    let ext3_openings = if let Some(zeta) = combined_whir.zeta {
+        let cs_polys = &circuit_data.prover_only.constants_sigmas_commitment.polynomials;
+        let num_constants = circuit_data.common.num_constants;
+
+        // constants_sigmas contains [constants..., sigma_polys...]
+        // constants = selectors + gate constant columns (num_constants total)
+        // sigmas = next num_routed_wires columns
+        let constants_evals = eval_polys_at_ext3(&cs_polys[..num_constants], zeta);
+        let sigma_evals = eval_polys_at_ext3(&cs_polys[num_constants..], zeta);
+        let wires_evals = eval_polys_at_ext3(&polys.wires, zeta);
+
+        // zs_partial_products: first `num_challenges` are Z polys, rest are partial products
+        let num_zs = circuit_data.common.config.num_challenges;
+        let zs_evals = eval_polys_at_ext3(&polys.zs_partial_products[..num_zs], zeta);
+        let pp_evals = eval_polys_at_ext3(&polys.zs_partial_products[num_zs..], zeta);
+
+        // plonk_zs_next: Z evaluated at g * zeta (next coset element)
+        // g = primitive root of unity of order 2^degree_bits over Goldilocks
+        use plonky2::field::goldilocks_field::GoldilocksField;
+        use plonky2::field::types::PrimeField64 as Plonky2PF64;
+        let g_plonky2 = GoldilocksField::primitive_root_of_unity(circuit_data.common.degree_bits());
+        let g = Field64::from(Plonky2PF64::to_canonical_u64(&g_plonky2));
+        let g_zeta = sumcheck::base_to_ext3(g) * zeta;
+        let zs_next_evals = eval_polys_at_ext3(&polys.zs_partial_products[..num_zs], g_zeta);
+
+        let quot_evals = eval_polys_at_ext3(&polys.quotient_chunks, zeta);
+
+        Some(Ext3Openings {
+            constants: constants_evals,
+            plonk_sigmas: sigma_evals,
+            wires: wires_evals,
+            plonk_zs: zs_evals,
+            plonk_zs_next: zs_next_evals,
+            partial_products: pp_evals,
+            quotient_polys: quot_evals,
+        })
+    } else {
+        None
+    };
+
     let proof = WhirPlonky2Proof {
         standard_proof,
         combined_whir,
         batch_sizes,
         batch_evals_at_zeta,
+        ext3_openings,
         expected_result,
     };
 
@@ -1167,9 +1249,10 @@ where
         let alphas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
         let zeta_c0 = squeeze_u64();
         let zeta_c1 = squeeze_u64();
-        (betas, gammas, alphas, zeta_c0, zeta_c1)
+        let zeta_c2 = squeeze_u64();
+        (betas, gammas, alphas, zeta_c0, zeta_c1, zeta_c2)
     };
-    let (keccak_betas, keccak_gammas, keccak_alphas, zeta_c0, zeta_c1) = keccak_challenges;
+    let (keccak_betas, keccak_gammas, keccak_alphas, zeta_c0, zeta_c1, zeta_c2) = keccak_challenges;
 
     // Circuit params
     let selectors_info = &common.selectors_info;
@@ -1193,8 +1276,33 @@ where
     // k_is for permutation
     let k_is: Vec<u64> = common.k_is.iter().map(|k| k.to_canonical_u64()).collect();
 
-    serde_json::json!({
-        "openings": {
+    // Helper to serialize Vec<Field64_3> as flat [c0,c1,c2, c0,c1,c2, ...]
+    let ext3_vec_to_flat = |v: &[Field64_3]| -> Vec<u64> {
+        use ark_ff::PrimeField as ArkPF;
+        v.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![
+                base[0].into_bigint().0[0],
+                base[1].into_bigint().0[0],
+                base[2].into_bigint().0[0],
+            ]
+        }).collect()
+    };
+
+    // Use Ext3 openings if available (unified ζ), otherwise fall back to Ext2
+    let openings_json = if let Some(ref ext3) = proof.ext3_openings {
+        serde_json::json!({
+            "constants": ext3_vec_to_flat(&ext3.constants),
+            "plonkSigmas": ext3_vec_to_flat(&ext3.plonk_sigmas),
+            "wires": ext3_vec_to_flat(&ext3.wires),
+            "plonkZs": ext3_vec_to_flat(&ext3.plonk_zs),
+            "plonkZsNext": ext3_vec_to_flat(&ext3.plonk_zs_next),
+            "partialProducts": ext3_vec_to_flat(&ext3.partial_products),
+            "quotientPolys": ext3_vec_to_flat(&ext3.quotient_polys),
+            "extensionDegree": 3,
+        })
+    } else {
+        serde_json::json!({
             "constants": ext_vec_to_flat(&openings.constants),
             "plonkSigmas": ext_vec_to_flat(&openings.plonk_sigmas),
             "wires": ext_vec_to_flat(&openings.wires),
@@ -1202,12 +1310,20 @@ where
             "plonkZsNext": ext_vec_to_flat(&openings.plonk_zs_next),
             "partialProducts": ext_vec_to_flat(&openings.partial_products),
             "quotientPolys": ext_vec_to_flat(&openings.quotient_polys),
-        },
+            "extensionDegree": 2,
+        })
+    };
+
+    // plonkZeta: Ext3 from Keccak challenge derivation
+    let plonk_zeta_json = serde_json::json!([zeta_c0, zeta_c1, zeta_c2]);
+
+    serde_json::json!({
+        "openings": openings_json,
         "challenges": {
             "plonkBetas": keccak_betas,
             "plonkGammas": keccak_gammas,
             "plonkAlphas": keccak_alphas,
-            "plonkZeta": [zeta_c0, zeta_c1],
+            "plonkZeta": plonk_zeta_json,
         },
         "circuitParams": {
             "degreeBits": common.degree_bits(),

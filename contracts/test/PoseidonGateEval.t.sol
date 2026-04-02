@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/PoseidonGateEval.sol";
 import "../src/PoseidonConstants.sol";
 import "../src/GoldilocksField.sol";
+import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
 
 contract PoseidonGateEvalTest is Test {
     /// @dev Test round constants match Plonky2
@@ -15,28 +16,28 @@ contract PoseidonGateEvalTest is Test {
         assertEq(PoseidonConstants.roundConstant(12), 0x86287821f722c881);
     }
 
-    /// @dev Test that Ext2 constraint evaluation returns exactly 123 constraints
-    function test_constraintCount_ext2() public pure {
-        GoldilocksExt2.Ext2[] memory wires = new GoldilocksExt2.Ext2[](135);
+    /// @dev Test that Ext3 constraint evaluation returns exactly 123 constraints
+    function test_constraintCount_ext3() public pure {
+        GoldilocksExt3.Ext3[] memory wires = new GoldilocksExt3.Ext3[](135);
         for (uint256 i = 0; i < 135; i++) {
-            wires[i] = GoldilocksExt2.zero();
+            wires[i] = GoldilocksExt3.zero();
         }
-        GoldilocksExt2.Ext2[] memory constraints = PoseidonGateEval.evaluateExt2(wires);
+        GoldilocksExt3.Ext3[] memory constraints = PoseidonGateEval.evaluateExt3(wires);
         assertEq(constraints.length, 123);
     }
 
-    /// @dev Gas estimation for Ext2 PoseidonGate evaluation
-    function test_gasEstimate_ext2() public {
-        GoldilocksExt2.Ext2[] memory wires = new GoldilocksExt2.Ext2[](135);
+    /// @dev Gas estimation for Ext3 PoseidonGate evaluation
+    function test_gasEstimate_ext3() public {
+        GoldilocksExt3.Ext3[] memory wires = new GoldilocksExt3.Ext3[](135);
         for (uint256 i = 0; i < 135; i++) {
-            wires[i] = GoldilocksExt2.zero();
+            wires[i] = GoldilocksExt3.zero();
         }
         uint256 gasBefore = gasleft();
-        PoseidonGateEval.evaluateExt2(wires);
+        PoseidonGateEval.evaluateExt3(wires);
         uint256 gasUsed = gasBefore - gasleft();
-        emit log_named_uint("PoseidonGate Ext2 evaluate gas", gasUsed);
-        // Ext2 version should be under 500K gas
-        assertLt(gasUsed, 500_000);
+        emit log_named_uint("PoseidonGate Ext3 evaluate gas", gasUsed);
+        // Ext3 version should be under 750K gas (more ops than Ext2)
+        assertLt(gasUsed, 750_000);
     }
 
     /// @dev Test MDS constants

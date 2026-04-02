@@ -149,8 +149,9 @@ library SumcheckBridgeVerifier {
     /// @return betas Challenge values for permutation
     /// @return gammas Challenge values for permutation
     /// @return alphas Challenge values for constraint reduction
-    /// @return zetaC0 Ext2 zeta component 0
-    /// @return zetaC1 Ext2 zeta component 1
+    /// @return zetaC0 Ext3 zeta component 0
+    /// @return zetaC1 Ext3 zeta component 1
+    /// @return zetaC2 Ext3 zeta component 2
     function deriveKeccakChallenges(
         bytes memory transcript,
         uint256[] memory publicInputs,
@@ -160,7 +161,8 @@ library SumcheckBridgeVerifier {
         uint256[] memory gammas,
         uint256[] memory alphas,
         uint256 zetaC0,
-        uint256 zetaC1
+        uint256 zetaC1,
+        uint256 zetaC2
     ) {
         // Initial hash: keccak256("plonky2-keccak-challenges" || transcript || PI_LE_bytes)
         bytes memory initData = abi.encodePacked("plonky2-keccak-challenges", transcript);
@@ -193,6 +195,9 @@ library SumcheckBridgeVerifier {
 
         state = keccak256(abi.encodePacked(state));
         zetaC1 = _leU64(uint256(state) >> 192) % GL_P;
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC2 = _leU64(uint256(state) >> 192) % GL_P;
     }
 
     /// @notice Verify polynomial decomposition: P(ζ) = Σ batch_i(ζ) · ζ^offset_i

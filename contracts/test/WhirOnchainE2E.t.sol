@@ -22,7 +22,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     /// @notice WHIR polynomial commitment: combined (all 4 batches concatenated)
     function test_whir_wrapper_combined() public view {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
+            string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
         );
         _verifyWhirCommitment(json, "combined");
     }
@@ -35,7 +35,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     ///         Calls Plonky2Verifier.verifyConstraints with real openings/challenges.
     function test_plonky2_constraints_wrapper() public {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/wrapper_constraint_data.json")
+            string.concat(vm.projectRoot(), "/test/data/test_constraint_data.json")
         );
         _verifyPlonky2Constraints(json);
     }
@@ -52,7 +52,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         // --- Combined WHIR verification (all 4 batches in 1 proof) ---
         {
             string memory json = vm.readFile(
-                string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
+                string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
             );
             gasBefore = gasleft();
             _verifyWhirCommitment(json, "combined");
@@ -63,7 +63,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         // --- Plonky2 constraint verification ---
         {
             string memory json = vm.readFile(
-                string.concat(vm.projectRoot(), "/test/data/wrapper_constraint_data.json")
+                string.concat(vm.projectRoot(), "/test/data/test_constraint_data.json")
             );
             _verifyPlonky2Constraints(json);
         }
@@ -76,7 +76,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     /// @notice Measure pure verifyWhirProof gas for the combined proof (excludes JSON parsing).
     function test_gas_pure_whir_verification() public {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
+            string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
         );
 
         // --- Parse all data BEFORE gas measurement ---
@@ -160,13 +160,13 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         uint256[] memory qpFlat = abi.decode(vm.parseJson(json, ".openings.quotientPolys"), (uint256[]));
 
         Plonky2Verifier.Openings memory openings;
-        openings.constants = _flatToExt2(constFlat);
-        openings.plonkSigmas = _flatToExt2(sigmaFlat);
-        openings.wires = _flatToExt2(wiresFlat);
-        openings.plonkZs = _flatToExt2(zsFlat);
-        openings.plonkZsNext = _flatToExt2(zsNextFlat);
-        openings.partialProducts = _flatToExt2(ppFlat);
-        openings.quotientPolys = _flatToExt2(qpFlat);
+        openings.constants = _flatToExt3(constFlat);
+        openings.plonkSigmas = _flatToExt3(sigmaFlat);
+        openings.wires = _flatToExt3(wiresFlat);
+        openings.plonkZs = _flatToExt3(zsFlat);
+        openings.plonkZsNext = _flatToExt3(zsNextFlat);
+        openings.partialProducts = _flatToExt3(ppFlat);
+        openings.quotientPolys = _flatToExt3(qpFlat);
 
         Plonky2Verifier.Challenges memory challenges;
         challenges.plonkBetas = abi.decode(vm.parseJson(json, ".challenges.plonkBetas"), (uint256[]));
@@ -174,7 +174,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         challenges.plonkAlphas = abi.decode(vm.parseJson(json, ".challenges.plonkAlphas"), (uint256[]));
         {
             uint256[] memory zetaFlat = abi.decode(vm.parseJson(json, ".challenges.plonkZeta"), (uint256[]));
-            challenges.plonkZeta = GoldilocksExt2.Ext2(zetaFlat[0], zetaFlat[1]);
+            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat.length > 2 ? zetaFlat[2] : 0));
         }
 
         Plonky2Verifier.PermutationData memory permData;
@@ -244,11 +244,11 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         return abi.decode(vm.parseJson(json, path), (uint256));
     }
 
-    function _flatToExt2(uint256[] memory flat) internal pure returns (GoldilocksExt2.Ext2[] memory) {
-        uint256 len = flat.length / 2;
-        GoldilocksExt2.Ext2[] memory result = new GoldilocksExt2.Ext2[](len);
+    function _flatToExt3(uint256[] memory flat) internal pure returns (GoldilocksExt3.Ext3[] memory) {
+        uint256 len = flat.length / 3;
+        GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt2.Ext2(flat[i * 2], flat[i * 2 + 1]);
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
         }
         return result;
     }

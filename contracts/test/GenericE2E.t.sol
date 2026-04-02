@@ -6,7 +6,7 @@ import {SpongefishWhirVerify} from "../src/spongefish/SpongefishWhirVerify.sol";
 import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
 import {SumcheckBridgeVerifier} from "../src/spongefish/SumcheckBridgeVerifier.sol";
 import {Plonky2Verifier} from "../src/Plonky2Verifier.sol";
-import {GoldilocksExt2} from "../src/GoldilocksField.sol";
+import {GoldilocksField, GoldilocksExt2} from "../src/GoldilocksField.sol";
 
 /// @title GenericE2ETest
 /// @notice E2E test using a generic Poseidon hash-chain circuit (no intmax3 dependency).
@@ -248,7 +248,8 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             uint256[] memory gammas,
             uint256[] memory alphas,
             uint256 zetaC0,
-            uint256 zetaC1
+            uint256 zetaC1,
+            uint256 zetaC2
         ) = SumcheckBridgeVerifier.deriveKeccakChallenges(transcript, publicInputs, numChallenges);
 
         // Compare with fixture values
@@ -264,6 +265,7 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         }
         require(zetaC0 == expectedZeta[0], "zeta.c0 mismatch");
         require(zetaC1 == expectedZeta[1], "zeta.c1 mismatch");
+        require(zetaC2 == expectedZeta[2], "zeta.c2 mismatch");
     }
 
     // =====================================================================
@@ -355,13 +357,13 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         uint256[] memory qpFlat = abi.decode(vm.parseJson(json, ".openings.quotientPolys"), (uint256[]));
 
         Openings memory openings;
-        openings.constants = _flatToExt2(constFlat);
-        openings.plonkSigmas = _flatToExt2(sigmaFlat);
-        openings.wires = _flatToExt2(wiresFlat);
-        openings.plonkZs = _flatToExt2(zsFlat);
-        openings.plonkZsNext = _flatToExt2(zsNextFlat);
-        openings.partialProducts = _flatToExt2(ppFlat);
-        openings.quotientPolys = _flatToExt2(qpFlat);
+        openings.constants = _flatToExt3(constFlat);
+        openings.plonkSigmas = _flatToExt3(sigmaFlat);
+        openings.wires = _flatToExt3(wiresFlat);
+        openings.plonkZs = _flatToExt3(zsFlat);
+        openings.plonkZsNext = _flatToExt3(zsNextFlat);
+        openings.partialProducts = _flatToExt3(ppFlat);
+        openings.quotientPolys = _flatToExt3(qpFlat);
 
         Challenges memory challenges;
         challenges.plonkBetas = abi.decode(vm.parseJson(json, ".challenges.plonkBetas"), (uint256[]));
@@ -369,7 +371,7 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         challenges.plonkAlphas = abi.decode(vm.parseJson(json, ".challenges.plonkAlphas"), (uint256[]));
         {
             uint256[] memory zetaFlat = abi.decode(vm.parseJson(json, ".challenges.plonkZeta"), (uint256[]));
-            challenges.plonkZeta = GoldilocksExt2.Ext2(zetaFlat[0], zetaFlat[1]);
+            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat.length > 2 ? zetaFlat[2] : 0));
         }
 
         PermutationData memory permData;
@@ -458,11 +460,11 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         return abi.decode(vm.parseJson(json, path), (uint256));
     }
 
-    function _flatToExt2(uint256[] memory flat) internal pure returns (GoldilocksExt2.Ext2[] memory) {
-        uint256 len = flat.length / 2;
-        GoldilocksExt2.Ext2[] memory result = new GoldilocksExt2.Ext2[](len);
+    function _flatToExt3(uint256[] memory flat) internal pure returns (GoldilocksExt3.Ext3[] memory) {
+        uint256 len = flat.length / 3;
+        GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt2.Ext2(flat[i * 2], flat[i * 2 + 1]);
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
         }
         return result;
     }

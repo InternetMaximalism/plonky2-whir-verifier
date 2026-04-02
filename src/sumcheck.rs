@@ -28,7 +28,7 @@ use ark_ff::{Field, AdditiveGroup};
 /// Embed a base field element into the cubic extension.
 /// Field64_3 = CubicExtField, which implements From<u64>.
 /// For Field64 → Field64_3: extract canonical u64, then construct.
-fn base_to_ext3(v: Field64) -> Field64_3 {
+pub fn base_to_ext3(v: Field64) -> Field64_3 {
     use ark_ff::PrimeField;
     let canonical = v.into_bigint().0[0];
     Field64_3::from(canonical)
