@@ -15,6 +15,24 @@ import {GoldilocksField} from "../src/GoldilocksField.sol";
 contract GenericE2ETest is Test, Plonky2Verifier {
 
     // =====================================================================
+    // Fixture generation — generates if not present
+    // =====================================================================
+
+    function setUp() public {
+        // Generate fixtures if not present.
+        // Fixtures are produced by `cargo run --bin generate_fixture --release`
+        // from the repo root. They are gitignored.
+        if (!vm.isFile("test/data/test_constraint_data.json")) {
+            // Use bash -c to cd to repo root and run cargo
+            string[] memory cmd = new string[](3);
+            cmd[0] = "bash";
+            cmd[1] = "-c";
+            cmd[2] = "cd .. && cargo +nightly run --bin generate_fixture --release 2>&1";
+            vm.ffi(cmd);
+        }
+    }
+
+    // =====================================================================
     // WHIR combined verification
     // =====================================================================
 
