@@ -117,18 +117,23 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
     // Unified proof verification (single JSON, single call)
     // =====================================================================
 
-    function test_unified_verify() public {
+    /// @notice Parse-only test (for gas delta measurement)
+    function test_unified_parse_only() public {
         string memory json = vm.readFile("test/data/test_proof.json");
-
-        // Parse the unified proof structure
         WhirPlonky2Proof memory proof = _parseUnifiedProof(json);
         CircuitConfig memory config = _parseCircuitConfig(json);
         SpongefishWhirVerify.WhirParams memory whirParams = _loadUnifiedWhirParams(json, proof);
+        // Just parse, don't verify — gas delta with test_unified_verify = pure verify() cost
+        assertTrue(proof.transcript.length > 0);
+    }
 
-        // Call verify() as internal (inherited from WhirPlonky2Verifier)
+    function test_unified_verify() public {
+        string memory json = vm.readFile("test/data/test_proof.json");
+        WhirPlonky2Proof memory proof = _parseUnifiedProof(json);
+        CircuitConfig memory config = _parseCircuitConfig(json);
+        SpongefishWhirVerify.WhirParams memory whirParams = _loadUnifiedWhirParams(json, proof);
         bool valid = verify(proof, config, whirParams);
         assertTrue(valid, "Unified WHIR-Plonky2 verification must pass");
-        console.log("[unified] Full verification PASSED");
     }
 
     // =====================================================================

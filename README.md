@@ -87,6 +87,38 @@ On-chain Verifier
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Quick Start
+
+### Prerequisites
+
+- **Rust nightly** (tested with 1.96.0+)
+- **Foundry** (forge, tested with v1.5.1+)
+
+### Build & Test
+
+```bash
+# 1. Build the fixture generator
+cargo +nightly build --bin generate_fixture --release
+
+# 2. Generate test fixtures (outputs to contracts/test/data/)
+#    Fixtures are gitignored — you must generate them before running Solidity tests.
+cargo +nightly run --bin generate_fixture --release
+
+# 3. Run Solidity tests
+cd contracts
+forge test
+```
+
+> **Note**: `forge test` will auto-generate fixtures via `vm.ffi` if `ffi = true` in `foundry.toml` and `test_constraint_data.json` is missing. However, this requires Rust nightly to be available in the shell. For reliability, run step 2 manually first.
+
+### Run Rust tests
+
+```bash
+cargo +nightly test --release
+```
+
+> Debug builds fail due to `debug_assertions` in the whir crate. Always use `--release`.
+
 ## Repository Structure
 
 ```
@@ -105,27 +137,25 @@ plonky2-whir-verifier/
 └── contracts/                      # Solidity (Foundry)
     ├── foundry.toml
     ├── src/
+    │   ├── WhirPlonky2Verifier.sol # 統一検証エントリポイント (verify())
     │   ├── Plonky2Verifier.sol     # 制約充足検証
     │   ├── GoldilocksField.sol     # Goldilocks 体演算 (p = 2^64 - 2^32 + 1)
     │   ├── PoseidonConstants.sol   # Poseidon ラウンド定数
     │   ├── PoseidonGateEval.sol    # Poseidon ゲート制約評価
     │   └── spongefish/
-    │       ├── SpongefishWhirVerify.sol  # WHIR 検証 + sumcheck point 対応
+    │       ├── SpongefishWhirVerify.sol  # WHIR 検証 (dual-point 対応)
+    │       ├── SumcheckBridgeVerifier.sol # Sumcheck bridge + recomposition
     │       ├── SpongefishWhir.sol        # WHIR トランスクリプト処理
     │       ├── SpongefishMerkle.sol      # Merkle ツリー検証
     │       ├── Keccak256Chain.sol        # Keccak スポンジ構成
     │       ├── DuplexSponge.sol          # Duplex スポンジモード
-    │       ├── GoldilocksExt3.sol        # 3次拡大体 (x^3 - 2)
+    │       ├── GoldilocksExt3.sol        # 3次拡大体 F_p[x]/(x^3-2)
     │       ├── WhirLinearAlgebra.sol     # Sumcheck 線形代数
     │       └── LibKeccak.sol            # Keccak256 プリミティブ
     └── test/
         ├── GenericE2E.t.sol            # 汎用 E2E テスト
-        ├── WhirOnchainE2E.t.sol        # WHIR 統合テスト
         ├── Plonky2Verifier.t.sol       # 制約検証テスト
-        ├── SpongefishWhir.t.sol        # トランスクリプトテスト
-        ├── GoldilocksField.t.sol       # 体演算テスト
-        ├── PoseidonGateEval.t.sol      # ゲート評価テスト
-        └── data/                       # テストフィクスチャ (JSON)
+        └── data/                       # テストフィクスチャ (gitignored, 自動生成)
 ```
 
 ## Key Modules
@@ -152,57 +182,40 @@ plonky2-whir-verifier/
 
 ## Benchmarks
 
-Measured on 2026-04-02.
+Measured on 2026-04-04 (rate=1/16, Ext3, Foundry v1.5.1, solc 0.8.29, via-ir).
 
-### Off-chain Proving (Rust nightly 1.96.0, release build)
+### Gas Consumption — On-chain Verification
+
+| Operation | Gas | Note |
+|-----------|-----|------|
+| **verify() (JSON parse除く)** | **~8.7M** | 本番on-chainコスト |
+| test_unified_verify (JSON parse込み) | 16.9M | forge test計測値 |
+| WHIR dual-point verification | 6.1M | |
+| Sumcheck bridges (ζ + gζ) | 2.7M | |
+| Plonky2 constraint check (Ext3) | 2.0M | |
+| Recomposition + decomposition | ~0.2M | Yul assembly |
+
+### Cost Estimate (L1, ETH ≈ $2,050)
+
+| Gas Price | verify() cost |
+|-----------|--------------|
+| 5 gwei | $0.09 |
+| 15 gwei | $0.27 |
+| 30 gwei | $0.53 |
+
+### Off-chain Proving (Rust nightly, release build)
 
 | Phase | Time |
 |-------|------|
-| Plonky2 prove | 8.36 ms |
-| WHIR prove | 6.09 ms |
-| **Total** | **14.45 ms** |
-| Estimated on-chain gas | ~1,069K |
-
-### Gas Consumption — On-chain Verification (Foundry v1.5.1, solc 0.8.29, via-ir, 200 runs)
-
-| Operation | Gas |
-|-----------|-----|
-| **Full E2E** (WHIR + Constraints) | 21,123,272 |
-| WHIR combined verification (1 proof) | 17,484,148 |
-| Pure WHIR verify (combined) | 13,794,219 |
-| Plonky2 constraint verification (wrapper) | 1,563,559 |
-| Plonky2 constraint verification (standard) | 1,648,731 |
-| Sumcheck bridge overhead | ~24,000 |
-
-### Gas Consumption (Unit Tests)
-
-| Test | Gas |
-|------|-----|
-| Transcript init from fixture | 1,549,605 |
-| Poseidon gate constraint evaluation | 142,779 |
-| Keccak256Chain deterministic | 6,152 |
-| GoldilocksExt3 `reduceWithPowers` | 4,030 |
-| GoldilocksField `inv` | 2,458 |
-| GoldilocksExt3 `inv` | 2,378 |
-| GoldilocksField `evalL0` | 2,015 |
-
-### Contract Sizes
-
-| Contract | Runtime (B) | Initcode (B) |
-|----------|-------------|--------------|
-| Plonky2Verifier | 20,741 | 20,767 |
-| Others (libraries) | 57 | 85 |
-
-> `Plonky2Verifier` は EVM の 24,576 B 制限に対し残り 3,835 B。他のコントラクトはすべてライブラリとしてデプロイされるため極小。
+| Plonky2 prove | ~12 ms |
+| WHIR prove (dual-point) | ~20 ms |
+| **Total** | **~32 ms** |
 
 ### Test Results
 
 ```
-Solidity: 35 tests passed, 0 failed (6 test suites)
-Rust:      8 passed, 0 failed (--release, includes 3 sumcheck tests)
+Solidity: 10 tests passed, 0 failed (GenericE2ETest)
 ```
-
-> Note: debug ビルドでは whir クレート内の `debug_assertions` により一部テストが失敗します。`cargo +nightly test --release` を使用してください。
 
 ## Prerequisites
 
