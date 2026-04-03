@@ -443,33 +443,41 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         Challenges memory chal,
         uint256[] memory publicInputs
     ) internal {
-        uint256 numChallenges = chal.plonkBetas.length;
-        // Step 5: Inter-batch decomposition at ζ
+        uint256[] memory batchSizes = abi.decode(vm.parseJson(constraintJson, ".batchSizes"), (uint256[]));
+        uint256[] memory polyCounts = abi.decode(vm.parseJson(constraintJson, ".intraBatchPolyCounts"), (uint256[]));
+        uint256 polyDegree = 1 << _u(constraintJson, ".circuitParams.degreeBits");
+
         GoldilocksExt3.Ext3 memory zetaExt3 = GoldilocksExt3.Ext3(
             uint64(_u(whirJson, ".sumcheck.zeta.c0")),
             uint64(_u(whirJson, ".sumcheck.zeta.c1")),
             uint64(_u(whirJson, ".sumcheck.zeta.c2"))
         );
-        uint256[] memory batchSizes = abi.decode(vm.parseJson(constraintJson, ".batchSizes"), (uint256[]));
-        uint256 nBatches = batchSizes.length;
-        GoldilocksExt3.Ext3[] memory batchEvalsZeta = _parseExt3Array(constraintJson, ".batchEvalsAtZeta", nBatches);
+
+        // =====================================================================
+        // Step 5: Recomposition at ζ (replaces inter-batch + intra-batch decomp)
+        // Single check: P(ζ) == Σ_j opening_j · ζ^{offset_j}
+        // =====================================================================
         {
+            GoldilocksExt3.Ext3[] memory allOpenings = _loadAllOpenings(constraintJson, polyCounts);
             GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
                 uint64(_u(whirJson, ".sumcheck.claimed_sum.c0")),
                 uint64(_u(whirJson, ".sumcheck.claimed_sum.c1")),
                 uint64(_u(whirJson, ".sumcheck.claimed_sum.c2"))
             );
-            SumcheckBridgeVerifier.verifyDecomposition(claimedSum, batchSizes, zetaExt3, batchEvalsZeta);
+            SumcheckBridgeVerifier.verifyRecomposition(claimedSum, batchSizes, polyCounts, polyDegree, zetaExt3, allOpenings);
         }
-        console.log("[e2e] Step 5: Inter-batch decomposition (zeta) PASSED");
+        console.log("[e2e] Step 5: Recomposition at zeta PASSED");
 
-        // Step 6: Inter-batch decomposition at gζ
+        // =====================================================================
+        // Step 6: gζ — inter-batch decomposition + batch 2 sub-decomposition
+        // gζ has no constraint check, so batch 2 needs explicit sub-decomp
+        // =====================================================================
         GoldilocksExt3.Ext3 memory gZetaExt3 = GoldilocksExt3.Ext3(
             uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c0")),
             uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c1")),
             uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c2"))
         );
-        GoldilocksExt3.Ext3[] memory batchEvalsGZ = _parseExt3Array(constraintJson, ".batchEvalsAtGZeta", nBatches);
+        GoldilocksExt3.Ext3[] memory batchEvalsGZ = _parseExt3Array(constraintJson, ".batchEvalsAtGZeta", batchSizes.length);
         {
             GoldilocksExt3.Ext3 memory claimedSumGZ = GoldilocksExt3.Ext3(
                 uint64(_u(whirJson, ".sumcheck_g_zeta.claimed_sum.c0")),
@@ -478,29 +486,13 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             );
             SumcheckBridgeVerifier.verifyDecomposition(claimedSumGZ, batchSizes, gZetaExt3, batchEvalsGZ);
         }
-        console.log("[e2e] Step 6: Inter-batch decomposition (g*zeta) PASSED");
-
-        // Step 7: Intra-batch sub-decomposition at ζ (all 4 batches)
-        uint256[] memory polyCounts = abi.decode(vm.parseJson(constraintJson, ".intraBatchPolyCounts"), (uint256[]));
-        uint256 polyDegree = 1 << _u(constraintJson, ".circuitParams.degreeBits");
-        for (uint256 b = 0; b < nBatches; b++) {
-            GoldilocksExt3.Ext3[] memory polyEvals = _parseExt3Array(
-                constraintJson,
-                string.concat(".intraBatchEvalsAtZeta[", vm.toString(b), "]"),
-                polyCounts[b]
-            );
-            SumcheckBridgeVerifier.verifySubDecomposition(batchEvalsZeta[b], polyDegree, zetaExt3, polyEvals);
-        }
-        console.log("[e2e] Step 7: Intra-batch sub-decomposition (zeta) PASSED");
-
-        // Step 8: Intra-batch sub-decomposition of batch 2 at gζ
         GoldilocksExt3.Ext3[] memory batch2PolyEvalsGZ = _parseExt3Array(
             constraintJson, ".batch2EvalsAtGZeta", polyCounts[2]
         );
         SumcheckBridgeVerifier.verifySubDecomposition(batchEvalsGZ[2], polyDegree, gZetaExt3, batch2PolyEvalsGZ);
-        console.log("[e2e] Step 8: Intra-batch sub-decomposition (batch2 at g*zeta) PASSED");
+        console.log("[e2e] Step 6: g*zeta decomposition + batch2 sub-decomp PASSED");
 
-        // Step 9-10: Build verified openings and check constraints
+        // Step 7-8: Build verified openings and check constraints
         _buildOpeningsAndVerifyConstraints(
             constraintJson, polyCounts, batch2PolyEvalsGZ,
             chal, publicInputs
@@ -720,6 +712,28 @@ contract GenericE2ETest is Test, Plonky2Verifier {
     }
 
     /// @dev Parse an array of Ext3 values from JSON at a given path prefix.
+    /// @dev Load all individual polynomial openings across all batches into a flat array.
+    function _loadAllOpenings(string memory json, uint256[] memory polyCounts)
+        internal pure returns (GoldilocksExt3.Ext3[] memory allOpenings)
+    {
+        uint256 total = 0;
+        for (uint256 b = 0; b < polyCounts.length; b++) total += polyCounts[b];
+        allOpenings = new GoldilocksExt3.Ext3[](total);
+        uint256 idx = 0;
+        for (uint256 b = 0; b < polyCounts.length; b++) {
+            for (uint256 j = 0; j < polyCounts[b]; j++) {
+                string memory prefix = string.concat(
+                    ".intraBatchEvalsAtZeta[", vm.toString(b), "][", vm.toString(j), "]."
+                );
+                allOpenings[idx++] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
+        }
+    }
+
     function _parseExt3Array(string memory json, string memory arrayPath, uint256 count)
         internal pure returns (GoldilocksExt3.Ext3[] memory result)
     {

@@ -408,6 +408,78 @@ library SumcheckBridgeVerifier {
         );
     }
 
+    /// @notice Verify that individual polynomial openings recompose to the WHIR-proven P(ζ).
+    ///         Replaces both inter-batch decomposition and intra-batch sub-decomposition
+    ///         with a single check: P(ζ) == Σ_j opening_j · ζ^{offset_j}
+    ///
+    ///         Layout: openings are ordered as [batch_0_poly_0, ..., batch_0_poly_{k0-1},
+    ///                 batch_1_poly_0, ..., batch_3_poly_{k3-1}]
+    ///         Each batch is padded to batchSizes[i] / polyDegree polynomials,
+    ///         and each polynomial has uniform degree = polyDegree.
+    ///
+    /// @param claimedSum The WHIR-proven P(ζ) (from sumcheck bridge)
+    /// @param batchSizes Sizes of each polynomial batch [d0, d1, d2, d3]
+    /// @param polyDegree Degree N of each individual polynomial (= 2^degreeBits)
+    /// @param zeta The evaluation point
+    /// @param allOpenings All 255 individual polynomial evaluations at ζ, in batch order
+    /// @param polyCounts Number of actual (non-padding) polynomials in each batch
+    function verifyRecomposition(
+        GoldilocksExt3.Ext3 memory claimedSum,
+        uint256[] memory batchSizes,
+        uint256[] memory polyCounts,
+        uint256 polyDegree,
+        GoldilocksExt3.Ext3 memory zeta,
+        GoldilocksExt3.Ext3[] memory allOpenings
+    ) internal pure {
+        // P(ζ) = Σ_j opening_j · ζ^{offset_j}
+        // Within each batch: polyCount actual polys + (batchSize/N - polyCount) zero-padded slots.
+        // Horner evaluation only over actual polys; padding slots contribute 0.
+        // Then multiply by ζ^(padding * N) to account for the padded slots' offsets.
+        GoldilocksExt3.Ext3 memory zetaN = _ext3Pow(zeta, polyDegree);
+        GoldilocksExt3.Ext3 memory recomputed = GoldilocksExt3.zero();
+        uint256 batchOffset = 0;
+        uint256 openIdx = 0;
+
+        for (uint256 b = 0; b < batchSizes.length; b++) {
+            uint256 totalSlots = batchSizes[b] / polyDegree;
+            uint256 nPolys = polyCounts[b];
+
+            // Horner over actual polynomials (indices 0..nPolys-1)
+            // batch_eval = opening[nPolys-1] * zetaN^{nPolys-1} + ... + opening[0]
+            GoldilocksExt3.Ext3 memory batchEval;
+            if (nPolys > 0) {
+                batchEval = allOpenings[openIdx + nPolys - 1];
+                for (uint256 i = nPolys - 1; i > 0; i--) {
+                    batchEval = batchEval.mul(zetaN).add(allOpenings[openIdx + i - 1]);
+                }
+            } else {
+                batchEval = GoldilocksExt3.zero();
+            }
+            // Padding slots (nPolys..totalSlots-1) are zero — they contribute
+            // 0 to the sum but shift the Horner base. The batch eval using
+            // only actual polys gives batch(ζ) since padding coefficients are 0.
+            // No explicit shift needed — the batch polynomial IS the padded version
+            // (polys_to_whir_field pads with zeros, so those slots evaluate to 0).
+
+            // Add batch contribution: recomputed += batchEval * ζ^{batchOffset}
+            if (batchOffset == 0) {
+                recomputed = batchEval;
+            } else {
+                recomputed = recomputed.add(batchEval.mul(_ext3Pow(zeta, batchOffset)));
+            }
+
+            batchOffset += batchSizes[b];
+            openIdx += nPolys;
+        }
+
+        require(
+            recomputed.c0 == claimedSum.c0 &&
+            recomputed.c1 == claimedSum.c1 &&
+            recomputed.c2 == claimedSum.c2,
+            "recomposition: P(zeta) != sum of all openings"
+        );
+    }
+
     /// @dev Evaluate degree-2 polynomial at point r via Lagrange interpolation on {0,1,2}.
     ///      g(r) = g(0)·L_0(r) + g(1)·L_1(r) + g(2)·L_2(r)
     ///      L_0(r) = (r-1)(r-2)/2, L_1(r) = -r(r-2), L_2(r) = r(r-1)/2
