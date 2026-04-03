@@ -1443,6 +1443,10 @@ where
                 "c2": base[2].into_bigint().0[0],
             })
         }).collect::<Vec<_>>(),
+        "batchEvalsAtGZetaFlat": proof.batch_evals_at_g_zeta.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![base[0].into_bigint().0[0], base[1].into_bigint().0[0], base[2].into_bigint().0[0]]
+        }).collect::<Vec<u64>>(),
         "intraBatchPolyCounts": proof.intra_batch_poly_counts,
         "intraBatchEvalsAtZeta": proof.intra_batch_evals_at_zeta.iter().map(|batch_evals| {
             batch_evals.iter().map(|e| {
@@ -1454,6 +1458,17 @@ where
                 })
             }).collect::<Vec<_>>()
         }).collect::<Vec<_>>(),
+        // Flat version for efficient bulk abi.decode (avoids per-element vm.parseJson)
+        "intraBatchEvalsAtZetaFlat": proof.intra_batch_evals_at_zeta.iter().map(|batch_evals| {
+            batch_evals.iter().flat_map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                vec![
+                    base[0].into_bigint().0[0],
+                    base[1].into_bigint().0[0],
+                    base[2].into_bigint().0[0],
+                ]
+            }).collect::<Vec<u64>>()
+        }).collect::<Vec<_>>(),
         "batch2EvalsAtGZeta": proof.batch2_evals_at_g_zeta.iter().map(|e| {
             let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
             serde_json::json!({
@@ -1462,6 +1477,14 @@ where
                 "c2": base[2].into_bigint().0[0],
             })
         }).collect::<Vec<_>>(),
+        "batch2EvalsAtGZetaFlat": proof.batch2_evals_at_g_zeta.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![
+                base[0].into_bigint().0[0],
+                base[1].into_bigint().0[0],
+                base[2].into_bigint().0[0],
+            ]
+        }).collect::<Vec<u64>>(),
     })
 }
 
