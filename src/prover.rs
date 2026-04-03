@@ -1572,6 +1572,315 @@ fn _gate_type_id(id: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Unified proof export (combined WHIR + Plonky2 data)
+// ---------------------------------------------------------------------------
+
+/// Export a single unified proof JSON combining WHIR verifier data, circuit
+/// configuration, and polynomial openings.
+///
+/// This merges the data from `export_onchain_data()` and `export_whir_verifier_data()`
+/// into one self-contained JSON structure suitable for the `WhirPlonky2Verifier` contract.
+///
+/// Fields removed from the old format:
+/// - `challenges` (re-derived on-chain from the Merkle root)
+/// - `openings` (old Ext2 format, replaced by flat Ext3 arrays)
+/// - `batchEvalsAtZeta` (replaced by `allOpeningsAtZetaFlat` recomposition)
+/// - `whir_config` (duplicate of `whirParams`)
+pub fn export_unified_proof<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    proof: &WhirPlonky2Proof<F, C, D>,
+    circuit_data: &CircuitData<F, C, D>,
+    config: &WhirWrapConfig,
+) -> serde_json::Value
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    use plonky2::field::types::PrimeField64;
+    use ark_ff::PrimeField as ArkPrimeField;
+
+    let common = &circuit_data.common;
+    let commitment = &proof.combined_whir;
+
+    // -----------------------------------------------------------------------
+    // Helper: Ext3 -> {c0, c1, c2} JSON
+    // -----------------------------------------------------------------------
+    let ext3_json = |e: &Field64_3| -> serde_json::Value {
+        let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+        serde_json::json!({
+            "c0": base[0].into_bigint().0[0],
+            "c1": base[1].into_bigint().0[0],
+            "c2": base[2].into_bigint().0[0],
+        })
+    };
+
+    let ext3_flat = |v: &[Field64_3]| -> Vec<u64> {
+        v.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![base[0].into_bigint().0[0], base[1].into_bigint().0[0], base[2].into_bigint().0[0]]
+        }).collect()
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.evaluations (WHIR MLE evaluations)
+    // -----------------------------------------------------------------------
+    let evaluations_structured: Vec<serde_json::Value> = commitment.evaluations.iter()
+        .map(|e| ext3_json(e))
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // proof.bridgeZeta — sumcheck bridge for ζ
+    // -----------------------------------------------------------------------
+    let bridge_zeta = match (&commitment.sumcheck_proof, &commitment.zeta, &commitment.claimed_sum, &commitment.eval_point) {
+        (Some(sc_proof), Some(zeta), Some(claimed_sum), Some(eval_pt)) => {
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| ext3_json(e)).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| ext3_json(e)).collect();
+            serde_json::json!({
+                "evalPoint": eval_point_json,
+                "claimedSum": ext3_json(claimed_sum),
+                "sessionName": commitment.session_name,
+                "roundPolys": round_polys,
+                "numRounds": sc_proof.round_polys.len(),
+                "zeta": ext3_json(zeta),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.bridgeGZeta — sumcheck bridge for gζ
+    // -----------------------------------------------------------------------
+    let bridge_g_zeta = match (
+        &commitment.sumcheck_proof_g_zeta,
+        &commitment.g_zeta,
+        &commitment.claimed_sum_g_zeta,
+        &commitment.eval_point_g_zeta,
+    ) {
+        (Some(sc_proof), Some(gz), Some(claimed_sum), Some(eval_pt)) => {
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| ext3_json(e)).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| ext3_json(e)).collect();
+            serde_json::json!({
+                "evalPoint": eval_point_json,
+                "claimedSum": ext3_json(claimed_sum),
+                "gZeta": ext3_json(gz),
+                "roundPolys": round_polys,
+                "numRounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.allOpeningsAtZetaFlat — all per-polynomial evals at ζ (flat c0,c1,c2 per batch)
+    // -----------------------------------------------------------------------
+    let all_openings_at_zeta_flat: Vec<Vec<u64>> = proof.intra_batch_evals_at_zeta.iter()
+        .map(|batch_evals| ext3_flat(batch_evals))
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // proof.batch2OpeningsAtGZetaFlat — per-polynomial evals of batch 2 at gζ
+    // -----------------------------------------------------------------------
+    let batch2_openings_at_g_zeta_flat: Vec<u64> = ext3_flat(&proof.batch2_evals_at_g_zeta);
+
+    // -----------------------------------------------------------------------
+    // proof.batchEvalsAtGZetaFlat — batch-level evaluations at gζ
+    // -----------------------------------------------------------------------
+    let batch_evals_at_g_zeta_flat: Vec<u64> = ext3_flat(&proof.batch_evals_at_g_zeta);
+
+    // -----------------------------------------------------------------------
+    // circuitConfig
+    // -----------------------------------------------------------------------
+    let selectors_info = &common.selectors_info;
+
+    let gate_infos: Vec<serde_json::Value> = common.gates.iter().enumerate().map(|(i, gate)| {
+        let sel_idx = selectors_info.selector_indices[i];
+        let group = &selectors_info.groups[sel_idx];
+        let id = gate.0.id();
+        serde_json::json!({
+            "gateType": _gate_type_id(&id),
+            "selectorIndex": sel_idx,
+            "groupStart": group.start,
+            "groupEnd": group.end,
+            "rowInGroup": i,
+            "numConstraints": gate.0.num_constraints(),
+            "gateConfig": _gate_config(&id),
+        })
+    }).collect();
+
+    let k_is: Vec<u64> = common.k_is.iter().map(|k| k.to_canonical_u64()).collect();
+
+    // -----------------------------------------------------------------------
+    // whirParams — computed from WHIR config
+    // -----------------------------------------------------------------------
+    let whir_params = {
+        let poly_size = 1usize << commitment.num_variables;
+        let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+        use ark_ff::FftField;
+        let gl_root_of_unity = |n: usize| -> u64 {
+            let g: Field64 = Field64::get_root_of_unity(n as u64)
+                .expect("No root of unity for requested size");
+            ark_ff::PrimeField::into_bigint(g).0[0]
+        };
+        let log2_of = |mut n: usize| -> usize {
+            let mut d = 0;
+            while n > 1 { n >>= 1; d += 1; }
+            d
+        };
+
+        let num_rounds = params.round_configs.len();
+        let initial_codeword_length = params.initial_committer.codeword_length;
+        let initial_mml = params.initial_committer.masked_message_length();
+        let initial_coset_size = {
+            let mut cs = initial_mml.next_power_of_two();
+            while initial_codeword_length % cs != 0 { cs *= 2; }
+            cs
+        };
+
+        let rounds_json: Vec<serde_json::Value> = params.round_configs.iter().map(|rc| {
+            let cl = rc.irs_committer.codeword_length;
+            let mml = rc.irs_committer.masked_message_length();
+            let mut cs = mml.next_power_of_two();
+            while cl % cs != 0 { cs *= 2; }
+            serde_json::json!({
+                "codeword_length": cl,
+                "merkle_depth": log2_of(cl),
+                "domain_generator": gl_root_of_unity(cl),
+                "in_domain_samples": rc.irs_committer.in_domain_samples,
+                "out_domain_samples": rc.irs_committer.out_domain_samples,
+                "sumcheck_rounds": rc.sumcheck.num_rounds,
+                "interleaving_depth": rc.irs_committer.interleaving_depth,
+                "coset_size": cs,
+                "num_cosets": cl / cs,
+                "num_variables": rc.initial_num_variables(),
+            })
+        }).collect();
+
+        serde_json::json!({
+            "num_variables": commitment.num_variables,
+            "folding_factor": config.params.folding_factor,
+            "num_vectors": params.initial_committer.num_vectors,
+            "out_domain_samples": params.initial_committer.out_domain_samples,
+            "in_domain_samples": params.initial_committer.in_domain_samples,
+            "initial_sumcheck_rounds": params.initial_sumcheck.num_rounds,
+            "num_rounds": num_rounds,
+            "final_sumcheck_rounds": params.final_sumcheck.num_rounds,
+            "final_size": params.final_sumcheck.initial_size,
+            "initial_codeword_length": initial_codeword_length,
+            "initial_merkle_depth": log2_of(initial_codeword_length),
+            "initial_domain_generator": gl_root_of_unity(initial_codeword_length),
+            "initial_interleaving_depth": params.initial_committer.interleaving_depth,
+            "initial_num_variables": params.initial_num_variables(),
+            "initial_coset_size": initial_coset_size,
+            "initial_num_cosets": initial_codeword_length / initial_coset_size,
+            "rounds": rounds_json,
+        })
+    };
+
+    // -----------------------------------------------------------------------
+    // WHIR protocol/session IDs (for verifyWhirProof)
+    // -----------------------------------------------------------------------
+    let (protocol_id, session_id) = {
+        let poly_size = 1usize << commitment.num_variables;
+        let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+        use sha3::{Digest, Keccak256};
+        let mut config_bytes = Vec::new();
+        ciborium::into_writer(&params, &mut config_bytes).expect("CBOR serialization failed");
+        let first: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x00]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let second: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x01]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let mut pid = [0u8; 64];
+        pid[..32].copy_from_slice(&first);
+        pid[32..].copy_from_slice(&second);
+
+        let mut session_bytes = Vec::new();
+        ciborium::into_writer(&commitment.session_name, &mut session_bytes)
+            .expect("CBOR serialization failed");
+        let mut h = Keccak256::new();
+        h.update(&session_bytes);
+        let sid: [u8; 32] = h.finalize().into();
+
+        (format!("0x{}", hex::encode(pid)), format!("0x{}", hex::encode(sid)))
+    };
+
+    // -----------------------------------------------------------------------
+    // Evaluation point for WHIR (sumcheck-derived r, or canonical)
+    // -----------------------------------------------------------------------
+    let eval_point: Vec<serde_json::Value> = match &commitment.eval_point {
+        Some(p) => p.iter().map(|e| ext3_json(e)).collect(),
+        None => (0..commitment.num_variables)
+            .map(|i| serde_json::json!({"c0": i + 1, "c1": 0, "c2": 0}))
+            .collect(),
+    };
+
+    let eval_point2: Vec<serde_json::Value> = match &commitment.eval_point_g_zeta {
+        Some(p) => p.iter().map(|e| ext3_json(e)).collect(),
+        None => vec![],
+    };
+
+    // -----------------------------------------------------------------------
+    // Assemble unified JSON
+    // -----------------------------------------------------------------------
+    serde_json::json!({
+        "proof": {
+            "protocolId": protocol_id,
+            "sessionId": session_id,
+            "instance": "0x",
+            "transcript": format!("0x{}", hex::encode(&commitment.proof_narg)),
+            "hints": format!("0x{}", hex::encode(&commitment.proof_hints)),
+            "evaluations": evaluations_structured,
+            "evaluationPoint": eval_point,
+            "evaluationPoint2": eval_point2,
+            "bridgeZeta": bridge_zeta,
+            "bridgeGZeta": bridge_g_zeta,
+            "allOpeningsAtZetaFlat": all_openings_at_zeta_flat,
+            "batch2OpeningsAtGZetaFlat": batch2_openings_at_g_zeta_flat,
+            "batchEvalsAtGZetaFlat": batch_evals_at_g_zeta_flat,
+            "publicInputs": proof.standard_proof.public_inputs.iter()
+                .map(|f| f.to_canonical_u64())
+                .collect::<Vec<_>>(),
+        },
+        "circuitConfig": {
+            "degreeBits": common.degree_bits(),
+            "numChallenges": common.config.num_challenges,
+            "numRoutedWires": common.config.num_routed_wires,
+            "quotientDegreeFactor": common.quotient_degree_factor,
+            "numPartialProducts": common.num_partial_products,
+            "numGateConstraints": common.num_gate_constraints,
+            "numSelectors": selectors_info.num_selectors(),
+            "numLookupSelectors": common.num_lookup_selectors,
+            "batchSizes": proof.batch_sizes,
+            "intraBatchPolyCounts": proof.intra_batch_poly_counts,
+            "gates": gate_infos,
+            "permutation": {
+                "kIs": k_is,
+            },
+            "sessionName": commitment.session_name,
+        },
+        "whirParams": whir_params,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
