@@ -232,22 +232,14 @@ library SumcheckBridgeVerifier {
     ) internal pure {
         require(batchSizes.length == batchEvals.length, "batch count mismatch");
 
-        // P(ζ) = batch_0(ζ) + ζ^d0 · batch_1(ζ) + ζ^(d0+d1) · batch_2(ζ) + ...
         GoldilocksExt3.Ext3 memory recomputed = batchEvals[0];
         uint256 offset = batchSizes[0];
         for (uint256 i = 1; i < batchEvals.length; i++) {
-            // ζ^offset via repeated squaring
-            GoldilocksExt3.Ext3 memory zetaPow = _ext3Pow(zeta, offset);
-            recomputed = recomputed.add(zetaPow.mul(batchEvals[i]));
+            recomputed = recomputed.add(_ext3Pow(zeta, offset).mul(batchEvals[i]));
             offset += batchSizes[i];
         }
 
-        require(
-            recomputed.c0 == claimedSum.c0 &&
-            recomputed.c1 == claimedSum.c1 &&
-            recomputed.c2 == claimedSum.c2,
-            "decomposition: P(zeta) != sum of batch evals"
-        );
+        require(GoldilocksExt3.eq(recomputed, claimedSum), "decomposition: P(zeta) mismatch");
     }
 
     /// @dev Compute a^n for Ext3 via binary exponentiation.
@@ -388,24 +380,87 @@ library SumcheckBridgeVerifier {
         GoldilocksExt3.Ext3 memory zeta,
         GoldilocksExt3.Ext3[] memory polyEvals
     ) internal pure {
-        require(polyEvals.length > 0, "subdecomp: empty polyEvals");
+        assembly ("memory-safe") {
+            let p := 0xFFFFFFFF00000001
+            let nPolys := mload(polyEvals)
+            if iszero(nPolys) {
+                mstore(0, 0x08c379a000000000000000000000000000000000000000000000000000000000)
+                mstore(4, 0x20)
+                mstore(0x24, 22)
+                mstore(0x44, "subdecomp: empty evals")
+                revert(0, 0x64)
+            }
 
-        // zetaN = zeta^N (the stride between polynomials)
-        GoldilocksExt3.Ext3 memory zetaN = _ext3Pow(zeta, polyDegree);
+            // Compute zetaN = zeta^polyDegree
+            let zn0 := 1
+            let zn1 := 0
+            let zn2 := 0
+            {
+                let base0 := mload(zeta)
+                let base1 := mload(add(zeta, 0x20))
+                let base2 := mload(add(zeta, 0x40))
+                let e := polyDegree
+                for {} gt(e, 0) {} {
+                    if and(e, 1) {
+                        let a0 := zn0  let a1 := zn1  let a2 := zn2
+                        let t := addmod(mulmod(a1, base2, p), mulmod(a2, base1, p), p)
+                        zn0 := addmod(mulmod(a0, base0, p), mulmod(2, t, p), p)
+                        let t2 := addmod(mulmod(a0, base1, p), mulmod(a1, base0, p), p)
+                        zn1 := addmod(t2, mulmod(2, mulmod(a2, base2, p), p), p)
+                        zn2 := addmod(addmod(mulmod(a0, base2, p), mulmod(a1, base1, p), p), mulmod(a2, base0, p), p)
+                    }
+                    {
+                        let a0 := base0  let a1 := base1  let a2 := base2
+                        let t := addmod(mulmod(a1, a2, p), mulmod(a2, a1, p), p)
+                        base0 := addmod(mulmod(a0, a0, p), mulmod(2, t, p), p)
+                        let t2 := addmod(mulmod(a0, a1, p), mulmod(a1, a0, p), p)
+                        base1 := addmod(t2, mulmod(2, mulmod(a2, a2, p), p), p)
+                        base2 := addmod(addmod(mulmod(a0, a2, p), mulmod(a1, a1, p), p), mulmod(a2, a0, p), p)
+                    }
+                    e := shr(1, e)
+                }
+            }
 
-        // Compute recomposition: polyEvals[0] + zetaN * polyEvals[1] + zetaN^2 * polyEvals[2] + ...
-        // Using Horner's method: ((polyEvals[k-1] * zetaN + polyEvals[k-2]) * zetaN + ...)
-        GoldilocksExt3.Ext3 memory recomputed = polyEvals[polyEvals.length - 1];
-        for (uint256 i = polyEvals.length - 1; i > 0; i--) {
-            recomputed = recomputed.mul(zetaN).add(polyEvals[i - 1]);
+            // Horner: result = polyEvals[nPolys-1], then for i down to 0: result = result*zetaN + polyEvals[i]
+            let peData := add(polyEvals, 0x20)
+            let lastPtr := mload(add(peData, mul(sub(nPolys, 1), 0x20)))
+            let r0 := mload(lastPtr)
+            let r1 := mload(add(lastPtr, 0x20))
+            let r2 := mload(add(lastPtr, 0x40))
+
+            for { let i := sub(nPolys, 1) } gt(i, 0) {} {
+                i := sub(i, 1)
+                // result *= zetaN
+                {
+                    let a0 := r0  let a1 := r1  let a2 := r2
+                    let t := addmod(mulmod(a1, zn2, p), mulmod(a2, zn1, p), p)
+                    r0 := addmod(mulmod(a0, zn0, p), mulmod(2, t, p), p)
+                    let t2 := addmod(mulmod(a0, zn1, p), mulmod(a1, zn0, p), p)
+                    r1 := addmod(t2, mulmod(2, mulmod(a2, zn2, p), p), p)
+                    r2 := addmod(addmod(mulmod(a0, zn2, p), mulmod(a1, zn1, p), p), mulmod(a2, zn0, p), p)
+                }
+                // result += polyEvals[i]
+                {
+                    let oPtr := mload(add(peData, mul(i, 0x20)))
+                    r0 := addmod(r0, mload(oPtr), p)
+                    r1 := addmod(r1, mload(add(oPtr, 0x20)), p)
+                    r2 := addmod(r2, mload(add(oPtr, 0x40)), p)
+                }
+            }
+
+            // Check: result == batchEval
+            if or(or(
+                iszero(eq(r0, mload(batchEval))),
+                iszero(eq(r1, mload(add(batchEval, 0x20))))),
+                iszero(eq(r2, mload(add(batchEval, 0x40))))
+            ) {
+                mstore(0, 0x08c379a000000000000000000000000000000000000000000000000000000000)
+                mstore(4, 0x20)
+                mstore(0x24, 25)
+                mstore(0x44, "subdecomp: eval mismatch")
+                revert(0, 0x64)
+            }
         }
-
-        require(
-            recomputed.c0 == batchEval.c0 &&
-            recomputed.c1 == batchEval.c1 &&
-            recomputed.c2 == batchEval.c2,
-            "subdecomp: batch eval != sum of poly evals"
-        );
     }
 
     /// @notice Verify that individual polynomial openings recompose to the WHIR-proven P(ζ).
@@ -431,53 +486,84 @@ library SumcheckBridgeVerifier {
         GoldilocksExt3.Ext3 memory zeta,
         GoldilocksExt3.Ext3[] memory allOpenings
     ) internal pure {
-        // P(ζ) = Σ_j opening_j · ζ^{offset_j}
-        // Within each batch: polyCount actual polys + (batchSize/N - polyCount) zero-padded slots.
-        // Horner evaluation only over actual polys; padding slots contribute 0.
-        // Then multiply by ζ^(padding * N) to account for the padded slots' offsets.
+        // Compute zetaN = zeta^polyDegree
         GoldilocksExt3.Ext3 memory zetaN = _ext3Pow(zeta, polyDegree);
+
+        // Horner evaluate each batch, then combine with zeta^batchOffset
         GoldilocksExt3.Ext3 memory recomputed = GoldilocksExt3.zero();
         uint256 batchOffset = 0;
         uint256 openIdx = 0;
 
         for (uint256 b = 0; b < batchSizes.length; b++) {
-            uint256 totalSlots = batchSizes[b] / polyDegree;
             uint256 nPolys = polyCounts[b];
 
-            // Horner over actual polynomials (indices 0..nPolys-1)
-            // batch_eval = opening[nPolys-1] * zetaN^{nPolys-1} + ... + opening[0]
-            GoldilocksExt3.Ext3 memory batchEval;
-            if (nPolys > 0) {
-                batchEval = allOpenings[openIdx + nPolys - 1];
-                for (uint256 i = nPolys - 1; i > 0; i--) {
-                    batchEval = batchEval.mul(zetaN).add(allOpenings[openIdx + i - 1]);
-                }
-            } else {
-                batchEval = GoldilocksExt3.zero();
-            }
-            // Padding slots (nPolys..totalSlots-1) are zero — they contribute
-            // 0 to the sum but shift the Horner base. The batch eval using
-            // only actual polys gives batch(ζ) since padding coefficients are 0.
-            // No explicit shift needed — the batch polynomial IS the padded version
-            // (polys_to_whir_field pads with zeros, so those slots evaluate to 0).
+            // Horner within batch (Yul for zero-alloc)
+            GoldilocksExt3.Ext3 memory batchEval = _hornerEval(allOpenings, openIdx, nPolys, zetaN);
 
-            // Add batch contribution: recomputed += batchEval * ζ^{batchOffset}
+            // result += batchEval * zeta^batchOffset
             if (batchOffset == 0) {
                 recomputed = batchEval;
             } else {
-                recomputed = recomputed.add(batchEval.mul(_ext3Pow(zeta, batchOffset)));
+                GoldilocksExt3.Ext3 memory scaled = batchEval.mul(_ext3Pow(zeta, batchOffset));
+                recomputed = recomputed.add(scaled);
             }
-
             batchOffset += batchSizes[b];
             openIdx += nPolys;
         }
 
         require(
-            recomputed.c0 == claimedSum.c0 &&
-            recomputed.c1 == claimedSum.c1 &&
-            recomputed.c2 == claimedSum.c2,
-            "recomposition: P(zeta) != sum of all openings"
+            GoldilocksExt3.eq(recomputed, claimedSum),
+            "recomposition: P(zeta) mismatch"
         );
+    }
+
+    /// @dev Horner evaluation of a slice of Ext3 array: result = Σ arr[start+j] · mult^j
+    ///      Uses Yul assembly for zero-allocation inner loop.
+    function _hornerEval(
+        GoldilocksExt3.Ext3[] memory arr,
+        uint256 start,
+        uint256 count,
+        GoldilocksExt3.Ext3 memory mult
+    ) private pure returns (GoldilocksExt3.Ext3 memory result) {
+        if (count == 0) return GoldilocksExt3.zero();
+
+        assembly ("memory-safe") {
+            let p := 0xFFFFFFFF00000001
+            let arrData := add(arr, 0x20)
+            let m0 := mload(mult)
+            let m1 := mload(add(mult, 0x20))
+            let m2 := mload(add(mult, 0x40))
+
+            // r = arr[start + count - 1]
+            let lastPtr := mload(add(arrData, mul(add(start, sub(count, 1)), 0x20)))
+            let r0 := mload(lastPtr)
+            let r1 := mload(add(lastPtr, 0x20))
+            let r2 := mload(add(lastPtr, 0x40))
+
+            for { let i := sub(count, 1) } gt(i, 0) {} {
+                i := sub(i, 1)
+                // r = r * mult
+                {
+                    let a0 := r0  let a1 := r1  let a2 := r2
+                    let t := addmod(mulmod(a1, m2, p), mulmod(a2, m1, p), p)
+                    r0 := addmod(mulmod(a0, m0, p), mulmod(2, t, p), p)
+                    let t2 := addmod(mulmod(a0, m1, p), mulmod(a1, m0, p), p)
+                    r1 := addmod(t2, mulmod(2, mulmod(a2, m2, p), p), p)
+                    r2 := addmod(addmod(mulmod(a0, m2, p), mulmod(a1, m1, p), p), mulmod(a2, m0, p), p)
+                }
+                // r += arr[start + i]
+                {
+                    let oPtr := mload(add(arrData, mul(add(start, i), 0x20)))
+                    r0 := addmod(r0, mload(oPtr), p)
+                    r1 := addmod(r1, mload(add(oPtr, 0x20)), p)
+                    r2 := addmod(r2, mload(add(oPtr, 0x40)), p)
+                }
+            }
+
+            mstore(result, r0)
+            mstore(add(result, 0x20), r1)
+            mstore(add(result, 0x40), r2)
+        }
     }
 
     /// @dev Evaluate degree-2 polynomial at point r via Lagrange interpolation on {0,1,2}.
