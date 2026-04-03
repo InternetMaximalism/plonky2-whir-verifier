@@ -22,7 +22,7 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         // Generate fixtures if not present.
         // Fixtures are produced by `cargo run --bin generate_fixture --release`
         // from the repo root. They are gitignored.
-        if (!vm.isFile("test/data/test_constraint_data.json") || !vm.isFile("test/data/test_proof.json")) {
+        if (!vm.isFile("test/data/test_constraint_data.json") || !vm.isFile("test/data/test_proof.json") || !vm.isFile("test/data/test_vk.json")) {
             // Use bash -c to cd to repo root and run cargo
             string[] memory cmd = new string[](3);
             cmd[0] = "bash";
@@ -114,26 +114,46 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
     }
 
     // =====================================================================
-    // Unified proof verification (single JSON, single call)
+    // Unified verification with immutable VK
     // =====================================================================
 
-    /// @notice Parse-only test (for gas delta measurement)
+    /// @notice Initialize VK from fixture, then verify proof.
+    ///         VK is set once via initialize() and cannot be changed.
+    function test_unified_verify() public {
+        // Load and initialize VK (normally done at deployment, once per circuit)
+        _initializeVK();
+
+        // Load proof (changes per verification)
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Verify proof against stored VK
+        bool valid = verify(proof);
+        assertTrue(valid, "Unified WHIR-Plonky2 verification must pass");
+    }
+
+    /// @notice Gas measurement: parse proof only (delta = pure verify cost)
     function test_unified_parse_only() public {
-        string memory json = vm.readFile("test/data/test_proof.json");
-        WhirPlonky2Proof memory proof = _parseUnifiedProof(json);
-        CircuitConfig memory config = _parseCircuitConfig(json);
-        SpongefishWhirVerify.WhirParams memory whirParams = _loadUnifiedWhirParams(json, proof);
-        // Just parse, don't verify — gas delta with test_unified_verify = pure verify() cost
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
         assertTrue(proof.transcript.length > 0);
     }
 
-    function test_unified_verify() public {
-        string memory json = vm.readFile("test/data/test_proof.json");
-        WhirPlonky2Proof memory proof = _parseUnifiedProof(json);
-        CircuitConfig memory config = _parseCircuitConfig(json);
-        SpongefishWhirVerify.WhirParams memory whirParams = _loadUnifiedWhirParams(json, proof);
-        bool valid = verify(proof, config, whirParams);
-        assertTrue(valid, "Unified WHIR-Plonky2 verification must pass");
+    bool private _vkInitialized;
+
+    function _initializeVK() internal {
+        if (_vkInitialized) return;
+        _vkInitialized = true;
+
+        string memory vkJson = vm.readFile("test/data/test_vk.json");
+        CircuitConfig memory config = _parseCircuitConfig(vkJson);
+        SpongefishWhirVerify.WhirParams memory whirParams = _loadWhirParamsFromVK(vkJson);
+        bytes memory protocolId = vm.parseJsonBytes(vkJson, ".protocolId");
+        bytes memory sessionId = vm.parseJsonBytes(vkJson, ".sessionId");
+        bytes memory instance = vm.parseJsonBytes(vkJson, ".instance");
+
+        this.initialize(config, whirParams, protocolId, sessionId, instance);
     }
 
     // =====================================================================
@@ -869,19 +889,16 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
     // Unified proof parsing helpers
     // =====================================================================
 
-    function _parseUnifiedProof(string memory json)
-        internal pure returns (WhirPlonky2Verifier.WhirPlonky2Proof memory proof)
+    /// @dev Parse proof from proof-only JSON (test_proof.json, no .proof prefix)
+    function _parseProof(string memory json)
+        internal view returns (Proof memory proof)
     {
-        proof.protocolId = vm.parseJsonBytes(json, ".proof.protocolId");
-        proof.sessionId = vm.parseJsonBytes(json, ".proof.sessionId");
-        proof.instance = vm.parseJsonBytes(json, ".proof.instance");
-        proof.transcript = vm.parseJsonBytes(json, ".proof.transcript");
-        proof.hints = vm.parseJsonBytes(json, ".proof.hints");
+        proof.transcript = vm.parseJsonBytes(json, ".transcript");
+        proof.hints = vm.parseJsonBytes(json, ".hints");
 
-        // Evaluations (2 for dual-point mode)
         proof.evaluations = new GoldilocksExt3.Ext3[](2);
         for (uint256 i = 0; i < 2; i++) {
-            string memory prefix = string.concat(".proof.evaluations[", vm.toString(i), "].");
+            string memory prefix = string.concat(".evaluations[", vm.toString(i), "].");
             proof.evaluations[i] = GoldilocksExt3.Ext3(
                 uint64(_u(json, string.concat(prefix, "c0"))),
                 uint64(_u(json, string.concat(prefix, "c1"))),
@@ -889,39 +906,101 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
             );
         }
 
-        // Bridge zeta
-        proof.bridgeZeta = _parseBridgeZeta(json);
+        proof.bridgeZeta = _parseBridgeZetaDirect(json);
+        proof.bridgeGZeta = _parseBridgeGZetaDirect(json);
 
-        // Bridge gZeta
-        proof.bridgeGZeta = _parseBridgeGZeta(json);
-
-        // All openings at zeta (flat per batch)
-        uint256[] memory polyCounts = abi.decode(vm.parseJson(json, ".circuitConfig.intraBatchPolyCounts"), (uint256[]));
+        // polyCounts from VK (already stored in contract)
+        uint256[] memory polyCounts = _circuitConfig.intraBatchPolyCounts;
         proof.allOpeningsAtZetaFlat = new uint256[][](polyCounts.length);
         for (uint256 b = 0; b < polyCounts.length; b++) {
-            string memory path = string.concat(".proof.allOpeningsAtZetaFlat[", vm.toString(b), "]");
+            string memory path = string.concat(".allOpeningsAtZetaFlat[", vm.toString(b), "]");
             proof.allOpeningsAtZetaFlat[b] = abi.decode(vm.parseJson(json, path), (uint256[]));
         }
 
-        // batch2 openings at gZeta flat
-        proof.batch2OpeningsAtGZetaFlat = abi.decode(
-            vm.parseJson(json, ".proof.batch2OpeningsAtGZetaFlat"), (uint256[])
-        );
+        proof.batch2OpeningsAtGZetaFlat = abi.decode(vm.parseJson(json, ".batch2OpeningsAtGZetaFlat"), (uint256[]));
+        proof.batchEvalsAtGZetaFlat = abi.decode(vm.parseJson(json, ".batchEvalsAtGZetaFlat"), (uint256[]));
+        proof.publicInputs = abi.decode(vm.parseJson(json, ".publicInputs"), (uint256[]));
+    }
 
-        // batch evals at gZeta flat
-        proof.batchEvalsAtGZetaFlat = abi.decode(
-            vm.parseJson(json, ".proof.batchEvalsAtGZetaFlat"), (uint256[])
+    function _parseBridgeZetaDirect(string memory json)
+        internal pure returns (SumcheckBridgeData memory bridge)
+    {
+        uint256 numRounds = _u(json, ".bridgeZeta.numRounds");
+        bridge.zeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".bridgeZeta.zeta.c0")),
+            uint64(_u(json, ".bridgeZeta.zeta.c1")),
+            uint64(_u(json, ".bridgeZeta.zeta.c2"))
         );
+        bridge.claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".bridgeZeta.claimedSum.c0")),
+            uint64(_u(json, ".bridgeZeta.claimedSum.c1")),
+            uint64(_u(json, ".bridgeZeta.claimedSum.c2"))
+        );
+        bridge.evalPoint = new GoldilocksExt3.Ext3[](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            string memory prefix = string.concat(".bridgeZeta.evalPoint[", vm.toString(i), "].");
+            bridge.evalPoint[i] = GoldilocksExt3.Ext3(
+                uint64(_u(json, string.concat(prefix, "c0"))),
+                uint64(_u(json, string.concat(prefix, "c1"))),
+                uint64(_u(json, string.concat(prefix, "c2")))
+            );
+        }
+        bridge.roundPolys = new GoldilocksExt3.Ext3[][](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            bridge.roundPolys[i] = new GoldilocksExt3.Ext3[](3);
+            for (uint256 j = 0; j < 3; j++) {
+                string memory prefix = string.concat(".bridgeZeta.roundPolys[", vm.toString(i), "][", vm.toString(j), "].");
+                bridge.roundPolys[i][j] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
+        }
+    }
 
-        // Public inputs
-        proof.publicInputs = abi.decode(vm.parseJson(json, ".proof.publicInputs"), (uint256[]));
+    function _parseBridgeGZetaDirect(string memory json)
+        internal pure returns (SumcheckBridgeGZetaData memory bridge)
+    {
+        uint256 numRounds = _u(json, ".bridgeGZeta.numRounds");
+        bridge.gZeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".bridgeGZeta.gZeta.c0")),
+            uint64(_u(json, ".bridgeGZeta.gZeta.c1")),
+            uint64(_u(json, ".bridgeGZeta.gZeta.c2"))
+        );
+        bridge.claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".bridgeGZeta.claimedSum.c0")),
+            uint64(_u(json, ".bridgeGZeta.claimedSum.c1")),
+            uint64(_u(json, ".bridgeGZeta.claimedSum.c2"))
+        );
+        bridge.evalPoint = new GoldilocksExt3.Ext3[](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            string memory prefix = string.concat(".bridgeGZeta.evalPoint[", vm.toString(i), "].");
+            bridge.evalPoint[i] = GoldilocksExt3.Ext3(
+                uint64(_u(json, string.concat(prefix, "c0"))),
+                uint64(_u(json, string.concat(prefix, "c1"))),
+                uint64(_u(json, string.concat(prefix, "c2")))
+            );
+        }
+        bridge.roundPolys = new GoldilocksExt3.Ext3[][](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            bridge.roundPolys[i] = new GoldilocksExt3.Ext3[](3);
+            for (uint256 j = 0; j < 3; j++) {
+                string memory prefix = string.concat(".bridgeGZeta.roundPolys[", vm.toString(i), "][", vm.toString(j), "].");
+                bridge.roundPolys[i][j] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
+        }
     }
 
     function _parseBridgeZeta(string memory json)
         internal pure returns (WhirPlonky2Verifier.SumcheckBridgeData memory bridge)
     {
         uint256 numRounds = _u(json, ".proof.bridgeZeta.numRounds");
-        bridge.sessionName = abi.decode(vm.parseJson(json, ".proof.bridgeZeta.sessionName"), (string));
+        // sessionName is now in VK, not in proof
 
         bridge.zeta = GoldilocksExt3.Ext3(
             uint64(_u(json, ".proof.bridgeZeta.zeta.c0")),
@@ -1054,9 +1133,48 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         return gates;
     }
 
+    /// @dev Load WhirParams from VK JSON. evaluationPoint/evaluationPoint2 are empty
+    ///      (they come from the proof, set during verify via _loadWhirParams).
+    function _loadWhirParamsFromVK(string memory json)
+        internal pure returns (SpongefishWhirVerify.WhirParams memory p)
+    {
+        p.numVariables = _u(json, ".whirParams.num_variables");
+        p.foldingFactor = _u(json, ".whirParams.folding_factor");
+        p.numVectors = _u(json, ".whirParams.num_vectors");
+        p.outDomainSamples = _u(json, ".whirParams.out_domain_samples");
+        p.inDomainSamples = _u(json, ".whirParams.in_domain_samples");
+        p.initialSumcheckRounds = _u(json, ".whirParams.initial_sumcheck_rounds");
+        p.numRounds = _u(json, ".whirParams.num_rounds");
+        p.finalSumcheckRounds = _u(json, ".whirParams.final_sumcheck_rounds");
+        p.finalSize = _u(json, ".whirParams.final_size");
+        p.initialCodewordLength = _u(json, ".whirParams.initial_codeword_length");
+        p.initialMerkleDepth = _u(json, ".whirParams.initial_merkle_depth");
+        p.initialDomainGenerator = uint64(_u(json, ".whirParams.initial_domain_generator"));
+        p.initialInterleavingDepth = _u(json, ".whirParams.initial_interleaving_depth");
+        p.initialNumVariables = _u(json, ".whirParams.initial_num_variables");
+        p.initialCosetSize = _u(json, ".whirParams.initial_coset_size");
+        p.initialNumCosets = _u(json, ".whirParams.initial_num_cosets");
+        // evaluationPoint and evaluationPoint2 are left empty —
+        // they are per-proof (sumcheck-derived) and set in verify()
+        p.rounds = new SpongefishWhirVerify.RoundParams[](p.numRounds);
+        for (uint256 i = 0; i < p.numRounds; i++) {
+            string memory prefix = string.concat(".whirParams.rounds[", vm.toString(i), "].");
+            p.rounds[i].codewordLength = _u(json, string.concat(prefix, "codeword_length"));
+            p.rounds[i].merkleDepth = _u(json, string.concat(prefix, "merkle_depth"));
+            p.rounds[i].domainGenerator = uint64(_u(json, string.concat(prefix, "domain_generator")));
+            p.rounds[i].inDomainSamples = _u(json, string.concat(prefix, "in_domain_samples"));
+            p.rounds[i].outDomainSamples = _u(json, string.concat(prefix, "out_domain_samples"));
+            p.rounds[i].sumcheckRounds = _u(json, string.concat(prefix, "sumcheck_rounds"));
+            p.rounds[i].interleavingDepth = _u(json, string.concat(prefix, "interleaving_depth"));
+            p.rounds[i].cosetSize = _u(json, string.concat(prefix, "coset_size"));
+            p.rounds[i].numCosets = _u(json, string.concat(prefix, "num_cosets"));
+            p.rounds[i].numVariables = _u(json, string.concat(prefix, "num_variables"));
+        }
+    }
+
     function _loadUnifiedWhirParams(
         string memory json,
-        WhirPlonky2Verifier.WhirPlonky2Proof memory proof
+        WhirPlonky2Verifier.Proof memory proof
     ) internal pure returns (SpongefishWhirVerify.WhirParams memory p) {
         p.numVariables = _u(json, ".whirParams.num_variables");
         p.foldingFactor = _u(json, ".whirParams.folding_factor");

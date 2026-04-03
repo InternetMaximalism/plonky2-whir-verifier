@@ -108,7 +108,7 @@ impl WhirWrapConfig {
                 initial_folding_factor: 4,
                 folding_factor: 4,
                 unique_decoding: false,
-                starting_log_inv_rate: 2,
+                starting_log_inv_rate: 4,
                 batch_size: 1,
                 hash_id: hash::KECCAK,
             },
@@ -1840,25 +1840,8 @@ where
     // -----------------------------------------------------------------------
     // Assemble unified JSON
     // -----------------------------------------------------------------------
-    serde_json::json!({
-        "proof": {
-            "protocolId": protocol_id,
-            "sessionId": session_id,
-            "instance": "0x",
-            "transcript": format!("0x{}", hex::encode(&commitment.proof_narg)),
-            "hints": format!("0x{}", hex::encode(&commitment.proof_hints)),
-            "evaluations": evaluations_structured,
-            "evaluationPoint": eval_point,
-            "evaluationPoint2": eval_point2,
-            "bridgeZeta": bridge_zeta,
-            "bridgeGZeta": bridge_g_zeta,
-            "allOpeningsAtZetaFlat": all_openings_at_zeta_flat,
-            "batch2OpeningsAtGZetaFlat": batch2_openings_at_g_zeta_flat,
-            "batchEvalsAtGZetaFlat": batch_evals_at_g_zeta_flat,
-            "publicInputs": proof.standard_proof.public_inputs.iter()
-                .map(|f| f.to_canonical_u64())
-                .collect::<Vec<_>>(),
-        },
+    // Split into VK (verifying key) and proof data
+    let vk = serde_json::json!({
         "circuitConfig": {
             "degreeBits": common.degree_bits(),
             "numChallenges": common.config.num_challenges,
@@ -1877,6 +1860,31 @@ where
             "sessionName": commitment.session_name,
         },
         "whirParams": whir_params,
+        "protocolId": protocol_id,
+        "sessionId": session_id,
+        "instance": "0x",
+    });
+
+    let proof_data = serde_json::json!({
+        "transcript": format!("0x{}", hex::encode(&commitment.proof_narg)),
+        "hints": format!("0x{}", hex::encode(&commitment.proof_hints)),
+        "evaluations": evaluations_structured,
+        "evaluationPoint": eval_point,
+        "evaluationPoint2": eval_point2,
+        "bridgeZeta": bridge_zeta,
+        "bridgeGZeta": bridge_g_zeta,
+        "allOpeningsAtZetaFlat": all_openings_at_zeta_flat,
+        "batch2OpeningsAtGZetaFlat": batch2_openings_at_g_zeta_flat,
+        "batchEvalsAtGZetaFlat": batch_evals_at_g_zeta_flat,
+        "publicInputs": proof.standard_proof.public_inputs.iter()
+            .map(|f| f.to_canonical_u64())
+            .collect::<Vec<_>>(),
+    });
+
+    // Return combined (for backward compat) with clear separation
+    serde_json::json!({
+        "vk": vk,
+        "proof": proof_data,
     })
 }
 

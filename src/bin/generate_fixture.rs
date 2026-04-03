@@ -110,12 +110,19 @@ fn main() -> Result<()> {
     )?;
     eprintln!("[fixture]   → contracts/test/data/whir/test_combined_verifier_data.json");
 
-    // Export unified proof (single file for WhirPlonky2Verifier)
-    eprintln!("[fixture] Step 6: Export unified proof");
+    // Export split VK + Proof (for WhirPlonky2Verifier with immutable VK)
+    eprintln!("[fixture] Step 6: Export VK + Proof (split)");
     let unified_data = export_unified_proof(&whir_result.proof, &cd, &whir_config);
+    // Write VK (verifying key — deployed once, never changes)
+    fs::write(
+        out_dir.join("test_vk.json"),
+        serde_json::to_string_pretty(&unified_data["vk"])?,
+    )?;
+    eprintln!("[fixture]   → contracts/test/data/test_vk.json");
+    // Write Proof (changes per verification)
     fs::write(
         out_dir.join("test_proof.json"),
-        serde_json::to_string_pretty(&unified_data)?,
+        serde_json::to_string_pretty(&unified_data["proof"])?,
     )?;
     eprintln!("[fixture]   → contracts/test/data/test_proof.json");
 
