@@ -128,25 +128,38 @@ pub struct WhirPolyCommitment {
     pub proof_hints: Vec<u8>,
     /// Number of multilinear variables (log2 of padded polynomial length).
     pub num_variables: usize,
-    /// WHIR-proven evaluation at the evaluation point.
+    /// WHIR-proven evaluations at the evaluation point(s).
+    /// Length 1 for single-point (legacy or ζ-only), length 2 for dual-point (ζ + gζ).
     pub evaluations: Vec<Field64_3>,
     /// Session label (for domain separation in Fiat-Shamir).
     pub session_name: String,
     /// Number of hash invocations during verification (for gas estimation).
     pub verify_hashes: usize,
-    /// Sumcheck proof bridging univariate p(ζ) to MLE evaluation at point r.
+    /// Sumcheck proof bridging univariate p(ζ) to MLE evaluation at point r₁.
     /// None for legacy (canonical point) mode.
     pub sumcheck_proof: Option<SumcheckProof>,
     /// The univariate evaluation point ζ (derived from WHIR transcript via Fiat-Shamir).
     /// None for legacy mode.
     pub zeta: Option<Field64_3>,
-    /// The sumcheck-derived evaluation point r = (r_1, ..., r_n).
-    /// This is where WHIR proves the MLE evaluates.
+    /// The sumcheck-derived evaluation point r₁ = (r₁_1, ..., r₁_n).
+    /// This is where WHIR proves the MLE evaluates for the ζ bridge.
     /// None for legacy mode (uses canonical point).
     pub eval_point: Option<Vec<Field64_3>>,
     /// The claimed univariate evaluation p(ζ) = Σ c_i · ζ^i.
     /// This is the sumcheck claimed sum. None for legacy mode.
     pub claimed_sum: Option<Field64_3>,
+    /// Second sumcheck proof bridging univariate p(gζ) to MLE evaluation at point r₂.
+    /// None if dual-point evaluation is not used.
+    pub sumcheck_proof_g_zeta: Option<SumcheckProof>,
+    /// The shifted evaluation point gζ (g = generator of trace subgroup H).
+    /// None if dual-point evaluation is not used.
+    pub g_zeta: Option<Field64_3>,
+    /// The sumcheck-derived evaluation point r₂ for the gζ bridge.
+    /// None if dual-point evaluation is not used.
+    pub eval_point_g_zeta: Option<Vec<Field64_3>>,
+    /// The claimed univariate evaluation p(gζ) = Σ c_i · (gζ)^i.
+    /// None if dual-point evaluation is not used.
+    pub claimed_sum_g_zeta: Option<Field64_3>,
 }
 
 /// Complete WHIR-based Plonky2 proof.
@@ -177,12 +190,23 @@ pub struct WhirPlonky2Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F 
     /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
     pub batch_evals_at_zeta: Vec<Field64_3>,
 
-    /// Per-polynomial Ext3 evaluations at ζ_sumcheck.
-    /// These replace the Ext2 openings from the standard Plonky2 proof.
-    /// Structure mirrors Plonky2's OpeningSet but in Ext3:
-    ///   constants, plonk_sigmas, wires, plonk_zs, plonk_zs_next,
-    ///   partial_products, quotient_polys
-    pub ext3_openings: Option<Ext3Openings>,
+    /// Evaluations of each batch polynomial at gζ (Ext3).
+    /// Used for on-chain decomposition of the second sumcheck bridge.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub batch_evals_at_g_zeta: Vec<Field64_3>,
+
+    /// Number of individual polynomials in each batch.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub intra_batch_poly_counts: Vec<usize>,
+
+    /// Per-polynomial evaluations within each batch at ζ.
+    /// Each inner Vec has length intra_batch_poly_counts[i].
+    /// Used for intra-batch sub-decomposition on-chain.
+    pub intra_batch_evals_at_zeta: Vec<Vec<Field64_3>>,
+
+    /// Per-polynomial evaluations of batch 2 (zs_partial_products) at gζ.
+    /// Used to extract verified Z(gζ) for the permutation check.
+    pub batch2_evals_at_g_zeta: Vec<Field64_3>,
 
     /// Public input: `true` = validity proof, `false` = fraud proof.
     /// This is bound into the WHIR proof's Fiat-Shamir transcript.
@@ -198,41 +222,6 @@ pub struct WhirPlonky2ProveResult<F: RichField + Extendable<D>, C: GenericConfig
     pub whir_time: Duration,
     /// Total wall-clock time.
     pub total_time: Duration,
-}
-
-/// Per-polynomial evaluations at sumcheck.zeta (Ext3).
-/// Mirrors Plonky2's OpeningSet structure but in the cubic extension field.
-#[derive(Clone, Debug)]
-pub struct Ext3Openings {
-    pub constants: Vec<Field64_3>,
-    pub plonk_sigmas: Vec<Field64_3>,
-    pub wires: Vec<Field64_3>,
-    pub plonk_zs: Vec<Field64_3>,
-    pub plonk_zs_next: Vec<Field64_3>,
-    pub partial_products: Vec<Field64_3>,
-    pub quotient_polys: Vec<Field64_3>,
-}
-
-// ---------------------------------------------------------------------------
-// Polynomial evaluation in Ext3
-// ---------------------------------------------------------------------------
-
-/// Evaluate a single polynomial (with base field coefficients) at an Ext3 point.
-/// Uses Horner's method: p(z) = c_0 + z*(c_1 + z*(c_2 + ...))
-fn eval_poly_at_ext3<F: RichField>(poly: &PolynomialCoeffs<F>, z: Field64_3) -> Field64_3 {
-    let mut result = Field64_3::ZERO;
-    for c in poly.coeffs.iter().rev() {
-        result = result * z + sumcheck::base_to_ext3(Field64::from(c.to_canonical_u64()));
-    }
-    result
-}
-
-/// Evaluate each polynomial in a batch at an Ext3 point, returning per-polynomial evaluations.
-fn eval_polys_at_ext3<F: RichField>(
-    polys: &[PolynomialCoeffs<F>],
-    z: Field64_3,
-) -> Vec<Field64_3> {
-    polys.iter().map(|p| eval_poly_at_ext3(p, z)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -360,25 +349,33 @@ fn whir_commit_and_prove(
         zeta: None,
         eval_point: None,
         claimed_sum: None,
+        sumcheck_proof_g_zeta: None,
+        g_zeta: None,
+        eval_point_g_zeta: None,
+        claimed_sum_g_zeta: None,
     }
 }
 
-/// Generate a WHIR commitment with sumcheck bridge for sound binding.
+/// Generate a WHIR commitment with dual sumcheck bridges for sound binding.
 ///
-/// New flow (replaces canonical point evaluation):
+/// Flow:
 /// 1. Commit to polynomial via WHIR (Merkle tree)
-/// 2. Derive ζ from WHIR transcript (Keccak Fiat-Shamir)
-/// 3. Compute p(ζ) = Σ c_i · ζ^i (univariate evaluation)
-/// 4. Run sumcheck prover to prove <f, h_ζ> = p(ζ)
-/// 5. WHIR evaluation proof at sumcheck-derived point r
+/// 2. Use externally-derived ζ (from unified Keccak Fiat-Shamir, Ext2 embedded in Ext3)
+/// 3. Compute p(ζ) = Σ c_i · ζ^i and optionally p(gζ) = Σ c_i · (gζ)^i
+/// 4. Run sumcheck prover(s) to prove <f, h_ζ> = p(ζ) (and <f, h_{gζ}> = p(gζ))
+/// 5. WHIR evaluation proof at sumcheck-derived point(s)
 ///
-/// This establishes cryptographic binding between the committed polynomial
-/// and its univariate evaluation at ζ, which was missing in the canonical
-/// point approach.
+/// The externally-derived ζ ensures the same evaluation point is used for both
+/// the sumcheck bridge and Plonky2 constraint checking (see `prove_with_whir`).
+///
+/// When `g_zeta` is provided, a second sumcheck bridge is run to prove p(gζ),
+/// which is needed for the permutation check's "next row" evaluation Z(gζ).
 fn whir_commit_and_prove_with_sumcheck(
     polynomial: &[Field64],
     session_name: &str,
     config: &WhirWrapConfig,
+    zeta: Field64_3,
+    g_zeta: Option<Field64_3>,
 ) -> WhirPolyCommitment {
     use ark_ff::{Field as ArkField, PrimeField};
     use sha3::{Digest, Keccak256};
@@ -396,37 +393,10 @@ fn whir_commit_and_prove_with_sumcheck(
     let mut prover_state = ProverState::new_std(&ds);
     let witness = params.commit(&mut prover_state, &[polynomial]);
 
-    // === PHASE 2: Derive ζ from transcript ===
-    // After WHIR commitment, the transcript state encodes the Merkle root.
-    // We squeeze ζ (in Ext3) from this state via Keccak.
-    // This makes ζ depend on the committed polynomial — the prover cannot
-    // choose ζ after seeing the commitment.
-    //
-    // Implementation: hash the session_name + polynomial hash to derive ζ.
-    // The polynomial hash binds ζ to the committed data (the Merkle root
-    // is derived from this data inside WHIR's commit phase).
-    let zeta = {
-        let mut h = Keccak256::new();
-        h.update(b"sumcheck-bridge-zeta");
-        h.update(session_name.as_bytes());
-        // Hash a deterministic representation of the polynomial
-        for &coeff in polynomial.iter() {
-            h.update(&coeff.into_bigint().0[0].to_le_bytes());
-        }
-        let hash_bytes: [u8; 32] = h.finalize().into();
-        // Derive 3 Ext3 components from the hash
-        let c0 = u64::from_le_bytes(hash_bytes[0..8].try_into().unwrap())
-            % Field64::MODULUS.0[0];
-        let c1 = u64::from_le_bytes(hash_bytes[8..16].try_into().unwrap())
-            % Field64::MODULUS.0[0];
-        let c2 = u64::from_le_bytes(hash_bytes[16..24].try_into().unwrap())
-            % Field64::MODULUS.0[0];
-        ark_ff::CubicExtField::new(
-            Field64::from(c0),
-            Field64::from(c1),
-            Field64::from(c2),
-        )
-    };
+    // === PHASE 2: ζ is provided externally (unified with Plonky2 Keccak challenges) ===
+    // ζ is an Ext2 element embedded in Ext3 as (c0, c1, 0).
+    // Since polynomial coefficients are base-field (Goldilocks), evaluations
+    // at this embedded Ext2 point will also have c2=0.
 
     // === PHASE 3: Compute p(ζ) = Σ c_i · ζ^i ===
     let p_at_zeta = sumcheck::eval_univariate_via_mle(polynomial, zeta);
@@ -436,58 +406,82 @@ fn whir_commit_and_prove_with_sumcheck(
         num_variables
     );
 
-    // === PHASE 4: Sumcheck prover ===
-    // Proves: Σ_{b ∈ {0,1}^n} f(b) · h_ζ(b) = p(ζ)
-    // Challenges derived from Keccak hash of round polynomials (Fiat-Shamir).
-    let mut challenge_transcript = Keccak256::new();
-    challenge_transcript.update(b"sumcheck-challenges");
-    challenge_transcript.update(session_name.as_bytes());
-    // Bind to ζ so challenges depend on the evaluation point
-    for c in ArkField::to_base_prime_field_elements(&zeta) {
-        challenge_transcript.update(&c.into_bigint().0[0].to_le_bytes());
-    }
+    // === PHASE 4a: Sumcheck prover for ζ ===
+    let make_challenge_fn = |tag: &str, eval_point: &Field64_3| -> Box<dyn FnMut(&[Field64_3; 3]) -> Field64_3> {
+        let mut transcript = Keccak256::new();
+        transcript.update(tag.as_bytes());
+        transcript.update(session_name.as_bytes());
+        for c in ArkField::to_base_prime_field_elements(eval_point) {
+            transcript.update(&c.into_bigint().0[0].to_le_bytes());
+        }
+        Box::new(move |g: &[Field64_3; 3]| {
+            for eval in g {
+                let base_elems: Vec<_> = ArkField::to_base_prime_field_elements(eval).collect();
+                for b in &base_elems {
+                    transcript.update(&b.into_bigint().0[0].to_le_bytes());
+                }
+            }
+            let h = transcript.clone().finalize();
+            let c0 = u64::from_le_bytes(h[0..8].try_into().unwrap()) % Field64::MODULUS.0[0];
+            let c1 = u64::from_le_bytes(h[8..16].try_into().unwrap()) % Field64::MODULUS.0[0];
+            let c2 = u64::from_le_bytes(h[16..24].try_into().unwrap()) % Field64::MODULUS.0[0];
+            ark_ff::CubicExtField::new(Field64::from(c0), Field64::from(c1), Field64::from(c2))
+        })
+    };
 
     let (sc_proof, sc_result) = sumcheck::sumcheck_prove(
         polynomial,
         zeta,
         p_at_zeta,
-        |g| {
-            // Fiat-Shamir: hash round polynomial to get challenge
-            for eval in g {
-                let base_elems: Vec<_> = ArkField::to_base_prime_field_elements(eval).collect();
-                for b in &base_elems {
-                    challenge_transcript.update(&b.into_bigint().0[0].to_le_bytes());
-                }
-            }
-            let h = challenge_transcript.clone().finalize();
-            let c0 = u64::from_le_bytes(h[0..8].try_into().unwrap())
-                % Field64::MODULUS.0[0];
-            let c1 = u64::from_le_bytes(h[8..16].try_into().unwrap())
-                % Field64::MODULUS.0[0];
-            let c2 = u64::from_le_bytes(h[16..24].try_into().unwrap())
-                % Field64::MODULUS.0[0];
-            ark_ff::CubicExtField::new(
-                Field64::from(c0),
-                Field64::from(c1),
-                Field64::from(c2),
-            )
-        },
+        make_challenge_fn("sumcheck-challenges", &zeta),
     );
-
     let eval_point = sc_result.point.clone();
 
     eprintln!(
-        "[whir-sumcheck] sumcheck done, {} rounds. WHIR proving at derived point...",
+        "[whir-sumcheck] sumcheck #1 done, {} rounds. eval_point derived.",
         eval_point.len()
     );
 
-    // === PHASE 5: WHIR evaluation proof at point r ===
-    let lf = MultilinearExtension::new(eval_point.clone());
-    let eval = lf.evaluate(params.embedding(), polynomial);
-    let evaluations = vec![eval];
+    // === PHASE 4b: Optional second sumcheck for gζ ===
+    let (sc_proof_g, sc_result_g, eval_point_g, p_at_g_zeta) = if let Some(gz) = g_zeta {
+        let p_gz = sumcheck::eval_univariate_via_mle(polynomial, gz);
+        let (proof_g, result_g) = sumcheck::sumcheck_prove(
+            polynomial,
+            gz,
+            p_gz,
+            make_challenge_fn("sumcheck-challenges-gzeta", &gz),
+        );
+        let ep_g = result_g.point.clone();
+        eprintln!(
+            "[whir-sumcheck] sumcheck #2 (gζ) done, {} rounds.",
+            ep_g.len()
+        );
+        (Some(proof_g), Some(result_g), Some(ep_g), Some(p_gz))
+    } else {
+        (None, None, None, None)
+    };
 
-    let prove_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
-        vec![Box::new(MultilinearExtension::new(eval_point.clone()))];
+    // === PHASE 5: WHIR evaluation proof at point(s) ===
+    let lf1 = MultilinearExtension::new(eval_point.clone());
+    let eval1 = lf1.evaluate(params.embedding(), polynomial);
+
+    let (evaluations, prove_lf): (Vec<Field64_3>, Vec<Box<dyn LinearForm<Field64_3>>>) =
+        if let Some(ref ep_g) = eval_point_g {
+            let lf2 = MultilinearExtension::new(ep_g.clone());
+            let eval2 = lf2.evaluate(params.embedding(), polynomial);
+            (
+                vec![eval1, eval2],
+                vec![
+                    Box::new(MultilinearExtension::new(eval_point.clone())),
+                    Box::new(MultilinearExtension::new(ep_g.clone())),
+                ],
+            )
+        } else {
+            (
+                vec![eval1],
+                vec![Box::new(MultilinearExtension::new(eval_point.clone()))],
+            )
+        };
 
     let _ = params.prove(
         &mut prover_state,
@@ -502,8 +496,14 @@ fn whir_commit_and_prove_with_sumcheck(
     let proof_hints = proof.hints.clone();
 
     // === VERIFY (off-chain sanity check) ===
-    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
-        vec![Box::new(MultilinearExtension::new(eval_point.clone()))];
+    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> = if let Some(ref ep_g) = eval_point_g {
+        vec![
+            Box::new(MultilinearExtension::new(eval_point.clone())),
+            Box::new(MultilinearExtension::new(ep_g.clone())),
+        ]
+    } else {
+        vec![Box::new(MultilinearExtension::new(eval_point.clone()))]
+    };
 
     HASH_COUNTER.reset();
     let mut verifier_state = VerifierState::new_std(&ds, &proof);
@@ -522,52 +522,30 @@ fn whir_commit_and_prove_with_sumcheck(
         .expect("WHIR final_claim verify failed");
     let verify_hashes = HASH_COUNTER.get();
 
-    // === Verify sumcheck consistency ===
-    // Check: final_claim from sumcheck == f(r) · h_ζ(r)
-    // where f(r) = MLE evaluation at point r = WHIR's eval
+    // === Verify sumcheck #1 consistency ===
     let h_at_r = sumcheck::eval_h_zeta(zeta, &eval_point);
-    let expected_final = eval * h_at_r;
-
-    // Also independently verify f(r) from the polynomial
-    // WHIR uses big-endian: point[0] = MSB, point[n-1] = LSB.
-    // For index i, bit j (from MSB) = (i >> (n-1-j)) & 1
-    let f_at_r_independent = {
-        let n = num_variables;
-        let mut result = Field64_3::ZERO;
-        for (i, &coeff) in polynomial.iter().enumerate() {
-            let c_ext3 = {
-                let canonical = coeff.into_bigint().0[0];
-                Field64_3::from(canonical)
-            };
-            let mut eq_val = Field64_3::ONE;
-            for j in 0..n {
-                // Big-endian: point[j] corresponds to bit (n-1-j) of index i
-                if (i >> (n - 1 - j)) & 1 == 1 {
-                    eq_val *= eval_point[j];
-                } else {
-                    eq_val *= Field64_3::ONE - eval_point[j];
-                }
-            }
-            result += c_ext3 * eq_val;
-        }
-        result
-    };
-    eprintln!("[whir-sumcheck] f(r) from WHIR eval: {:?}", eval);
-    eprintln!("[whir-sumcheck] f(r) independent:     {:?}", f_at_r_independent);
-    eprintln!("[whir-sumcheck] h_ζ(r):               {:?}", h_at_r);
-    eprintln!("[whir-sumcheck] f(r)*h_ζ(r):          {:?}", f_at_r_independent * h_at_r);
-    eprintln!("[whir-sumcheck] sc final_claim:        {:?}", sc_result.final_claim);
-
-    assert_eq!(
-        eval, f_at_r_independent,
-        "WHIR eval != independent f(r) computation"
-    );
+    let expected_final = eval1 * h_at_r;
     assert_eq!(
         sc_result.final_claim, expected_final,
-        "Sumcheck final claim mismatch: claim != f(r) * h_ζ(r)"
+        "Sumcheck #1 final claim mismatch: claim != f(r₁) * h_ζ(r₁)"
     );
 
-    eprintln!("[whir-sumcheck] All checks passed. verify_hashes={}", verify_hashes);
+    // === Verify sumcheck #2 consistency (if applicable) ===
+    if let (Some(gz), Some(ref ep_g), Some(ref res_g)) = (g_zeta, &eval_point_g, &sc_result_g) {
+        let eval2 = evaluations[1];
+        let h_at_r2 = sumcheck::eval_h_zeta(gz, ep_g);
+        let expected_final2 = eval2 * h_at_r2;
+        assert_eq!(
+            res_g.final_claim, expected_final2,
+            "Sumcheck #2 final claim mismatch: claim != f(r2) * h_gz(r2)"
+        );
+    }
+
+    eprintln!(
+        "[whir-sumcheck] All checks passed. verify_hashes={}, dual={}",
+        verify_hashes,
+        g_zeta.is_some()
+    );
 
     WhirPolyCommitment {
         proof_narg,
@@ -580,6 +558,10 @@ fn whir_commit_and_prove_with_sumcheck(
         zeta: Some(zeta),
         eval_point: Some(eval_point),
         claimed_sum: Some(p_at_zeta),
+        sumcheck_proof_g_zeta: sc_proof_g,
+        g_zeta,
+        eval_point_g_zeta: eval_point_g,
+        claimed_sum_g_zeta: p_at_g_zeta,
     }
 }
 
@@ -771,10 +753,91 @@ where
         batch_sizes
     );
 
+    let session_name = format!("whir-plonky2-combined-{}", er_tag);
+
+    // Step 1: Generate initial WHIR proof at canonical point to extract Merkle root.
+    // The Merkle root is the first 32 bytes of proof_narg and is deterministic
+    // from the polynomial (independent of evaluation point).
+    let canonical_whir = whir_commit_and_prove(
+        &combined_poly,
+        &session_name,
+        whir_config,
+    );
+    let merkle_root: [u8; 32] = canonical_whir.proof_narg[0..32]
+        .try_into()
+        .expect("WHIR transcript must start with 32-byte Merkle root");
+    eprintln!("[whir] Merkle root: {}", hex::encode(&merkle_root));
+
+    // Step 2: Derive unified ζ from Merkle root + session + public inputs.
+    // This matches the on-chain derivation (both sides hash the same data).
+    // ζ is Ext2 embedded in Ext3 as (c0, c1, 0) so that base-field polynomial
+    // evaluations at ζ have c2=0, compatible with Plonky2Verifier's Ext2 arithmetic.
+    let (zeta_ext3, zeta_c0, zeta_c1, zeta_c2) = {
+        use sha3::{Digest, Keccak256};
+        const GL_P: u64 = 0xFFFFFFFF00000001u64;
+
+        let mut h = Keccak256::new();
+        h.update(b"plonky2-challenges-v2");
+        h.update(session_name.as_bytes());
+        h.update(&merkle_root);
+        for &pi in &standard_proof.public_inputs {
+            h.update(&pi.to_canonical_u64().to_le_bytes());
+        }
+        let mut state: Vec<u8> = h.finalize().to_vec();
+
+        let mut squeeze_u64 = || -> u64 {
+            let mut h2 = Keccak256::new();
+            h2.update(&state);
+            state = h2.finalize().to_vec();
+            u64::from_le_bytes(state[0..8].try_into().unwrap()) % GL_P
+        };
+
+        // Squeeze betas, gammas, alphas first (matching on-chain order)
+        let num_challenges = circuit_data.common.config.num_challenges;
+        let _betas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let _gammas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let _alphas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let c0 = squeeze_u64();
+        let c1 = squeeze_u64();
+        let c2 = squeeze_u64();
+
+        // Full Ext3 zeta (no Ext2 embedding — using native Ext3 throughout)
+        let zeta = ark_ff::CubicExtField::new(
+            Field64::from(c0),
+            Field64::from(c1),
+            Field64::from(c2),
+        );
+        (zeta, c0, c1, c2)
+    };
+
+    eprintln!(
+        "[whir] Unified ζ derived from Merkle root: c0={}, c1={}",
+        zeta_c0, zeta_c1
+    );
+
+    // Step 3: Compute g (generator of trace subgroup H) and gζ.
+    // g = ω^(1) where ω is the 2^degree_bits-th primitive root of unity.
+    let g_zeta_ext3 = {
+        use plonky2::field::types::PrimeField64;
+        let degree_bits = circuit_data.common.degree_bits();
+        // Goldilocks primitive root of unity for subgroup of order 2^degree_bits
+        let g_u64 = plonky2::field::goldilocks_field::GoldilocksField::primitive_root_of_unity(degree_bits)
+            .to_canonical_u64();
+        let g_ext3 = ark_ff::CubicExtField::new(
+            Field64::from(g_u64),
+            Field64::ZERO,
+            Field64::ZERO,
+        );
+        g_ext3 * zeta_ext3
+    };
+
+    // Step 4: Generate final WHIR proof with dual sumcheck bridges (ζ and gζ).
     let combined_whir = whir_commit_and_prove_with_sumcheck(
         &combined_poly,
-        &format!("whir-plonky2-combined-{}", er_tag),
+        &session_name,
         whir_config,
+        zeta_ext3,
+        Some(g_zeta_ext3),
     );
 
     let whir_time = whir_start.elapsed();
@@ -783,70 +846,74 @@ where
     // Assemble proof
     // -----------------------------------------------------------------------
 
-    // Compute batch evaluations at sumcheck.zeta for on-chain decomposition check.
-    let batch_evals_at_zeta = if let Some(zeta) = combined_whir.zeta {
-        let b0 = polys_to_whir_field(&circuit_data.prover_only.constants_sigmas_commitment.polynomials);
-        let b1 = polys_to_whir_field(&polys.wires);
-        let b2 = polys_to_whir_field(&polys.zs_partial_products);
-        let b3 = polys_to_whir_field(&polys.quotient_chunks);
-        vec![
-            sumcheck::eval_univariate_via_mle(&b0, zeta),
-            sumcheck::eval_univariate_via_mle(&b1, zeta),
-            sumcheck::eval_univariate_via_mle(&b2, zeta),
-            sumcheck::eval_univariate_via_mle(&b3, zeta),
-        ]
-    } else {
-        vec![]
-    };
+    let zeta = combined_whir.zeta.expect("sumcheck bridge must set zeta");
+    let g_zeta = combined_whir.g_zeta.expect("dual bridge must set g_zeta");
 
-    // Compute per-polynomial Ext3 evaluations at ζ_sumcheck.
-    // These replace the Ext2 openings for on-chain constraint verification.
-    let ext3_openings = if let Some(zeta) = combined_whir.zeta {
-        let cs_polys = &circuit_data.prover_only.constants_sigmas_commitment.polynomials;
-        let num_constants = circuit_data.common.num_constants;
+    // Compute batch evaluations at ζ and gζ for on-chain decomposition checks.
+    let b0 = polys_to_whir_field(&circuit_data.prover_only.constants_sigmas_commitment.polynomials);
+    let b1 = polys_to_whir_field(&polys.wires);
+    let b2 = polys_to_whir_field(&polys.zs_partial_products);
+    let b3 = polys_to_whir_field(&polys.quotient_chunks);
 
-        // constants_sigmas contains [constants..., sigma_polys...]
-        // constants = selectors + gate constant columns (num_constants total)
-        // sigmas = next num_routed_wires columns
-        let constants_evals = eval_polys_at_ext3(&cs_polys[..num_constants], zeta);
-        let sigma_evals = eval_polys_at_ext3(&cs_polys[num_constants..], zeta);
-        let wires_evals = eval_polys_at_ext3(&polys.wires, zeta);
+    let batch_evals_at_zeta = vec![
+        sumcheck::eval_univariate_via_mle(&b0, zeta),
+        sumcheck::eval_univariate_via_mle(&b1, zeta),
+        sumcheck::eval_univariate_via_mle(&b2, zeta),
+        sumcheck::eval_univariate_via_mle(&b3, zeta),
+    ];
 
-        // zs_partial_products: first `num_challenges` are Z polys, rest are partial products
-        let num_zs = circuit_data.common.config.num_challenges;
-        let zs_evals = eval_polys_at_ext3(&polys.zs_partial_products[..num_zs], zeta);
-        let pp_evals = eval_polys_at_ext3(&polys.zs_partial_products[num_zs..], zeta);
+    let batch_evals_at_g_zeta = vec![
+        sumcheck::eval_univariate_via_mle(&b0, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b1, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b2, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b3, g_zeta),
+    ];
 
-        // plonk_zs_next: Z evaluated at g * zeta (next coset element)
-        // g = primitive root of unity of order 2^degree_bits over Goldilocks
-        use plonky2::field::goldilocks_field::GoldilocksField;
-        use plonky2::field::types::PrimeField64 as Plonky2PF64;
-        let g_plonky2 = GoldilocksField::primitive_root_of_unity(circuit_data.common.degree_bits());
-        let g = Field64::from(Plonky2PF64::to_canonical_u64(&g_plonky2));
-        let g_zeta = sumcheck::base_to_ext3(g) * zeta;
-        let zs_next_evals = eval_polys_at_ext3(&polys.zs_partial_products[..num_zs], g_zeta);
+    // Compute intra-batch sub-decomposition: per-polynomial evaluations.
+    // Within each batch, individual polynomials are concatenated with uniform
+    // degree N = 2^degree_bits. So batch_i(ζ) = Σ_j poly_j(ζ) · ζ^{j·N}.
+    let degree = 1usize << circuit_data.common.degree_bits();
+    let batch_polys_raw = [
+        &circuit_data.prover_only.constants_sigmas_commitment.polynomials,
+        &polys.wires,
+        &polys.zs_partial_products,
+        &polys.quotient_chunks,
+    ];
 
-        let quot_evals = eval_polys_at_ext3(&polys.quotient_chunks, zeta);
+    let intra_batch_poly_counts: Vec<usize> = batch_polys_raw.iter()
+        .map(|ps| ps.len())
+        .collect();
 
-        Some(Ext3Openings {
-            constants: constants_evals,
-            plonk_sigmas: sigma_evals,
-            wires: wires_evals,
-            plonk_zs: zs_evals,
-            plonk_zs_next: zs_next_evals,
-            partial_products: pp_evals,
-            quotient_polys: quot_evals,
+    let intra_batch_evals_at_zeta: Vec<Vec<Field64_3>> = batch_polys_raw.iter()
+        .map(|ps| {
+            ps.iter().map(|p| {
+                let whir_coeffs: Vec<Field64> = p.coeffs.iter()
+                    .map(|c| Field64::from(c.to_canonical_u64()))
+                    .collect();
+                sumcheck::eval_univariate_via_mle_raw(&whir_coeffs, zeta, degree)
+            }).collect()
         })
-    } else {
-        None
-    };
+        .collect();
+
+    // Per-polynomial evaluations of batch 2 (zs_partial_products) at gζ.
+    let batch2_evals_at_g_zeta: Vec<Field64_3> = polys.zs_partial_products.iter()
+        .map(|p| {
+            let whir_coeffs: Vec<Field64> = p.coeffs.iter()
+                .map(|c| Field64::from(c.to_canonical_u64()))
+                .collect();
+            sumcheck::eval_univariate_via_mle_raw(&whir_coeffs, g_zeta, degree)
+        })
+        .collect();
 
     let proof = WhirPlonky2Proof {
         standard_proof,
         combined_whir,
         batch_sizes,
         batch_evals_at_zeta,
-        ext3_openings,
+        batch_evals_at_g_zeta,
+        intra_batch_poly_counts,
+        intra_batch_evals_at_zeta,
+        batch2_evals_at_g_zeta,
         expected_result,
     };
 
@@ -1048,6 +1115,54 @@ pub fn export_whir_verifier_data(
         _ => serde_json::json!(null),
     };
 
+    // Second sumcheck bridge data for gζ (if present)
+    let sumcheck_g_zeta_data = match (
+        &commitment.sumcheck_proof_g_zeta,
+        &commitment.g_zeta,
+        &commitment.claimed_sum_g_zeta,
+        &commitment.eval_point_g_zeta,
+    ) {
+        (Some(sc_proof), Some(gz), Some(claimed_sum), Some(eval_pt)) => {
+            let gz_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(gz).collect();
+            let cs_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(claimed_sum).collect();
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| {
+                    let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                    serde_json::json!({
+                        "c0": base[0].into_bigint().0[0],
+                        "c1": base[1].into_bigint().0[0],
+                        "c2": base[2].into_bigint().0[0],
+                    })
+                }).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                serde_json::json!({
+                    "c0": base[0].into_bigint().0[0],
+                    "c1": base[1].into_bigint().0[0],
+                    "c2": base[2].into_bigint().0[0],
+                })
+            }).collect();
+            serde_json::json!({
+                "g_zeta": {
+                    "c0": gz_elems[0].into_bigint().0[0],
+                    "c1": gz_elems[1].into_bigint().0[0],
+                    "c2": gz_elems[2].into_bigint().0[0],
+                },
+                "claimed_sum": {
+                    "c0": cs_elems[0].into_bigint().0[0],
+                    "c1": cs_elems[1].into_bigint().0[0],
+                    "c2": cs_elems[2].into_bigint().0[0],
+                },
+                "eval_point": eval_point_json,
+                "round_polys": round_polys,
+                "num_rounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
     // Compute detailed WHIR protocol parameters for Solidity verifier
     let num_rounds = params.round_configs.len();
     let final_sumcheck_rounds = params.final_sumcheck.num_rounds;
@@ -1119,6 +1234,7 @@ pub fn export_whir_verifier_data(
         "evaluations": evaluations_structured,
         "evaluation_point": point,
         "sumcheck": sumcheck_data,
+        "sumcheck_g_zeta": sumcheck_g_zeta_data,
         "session_name": commitment.session_name,
         "whir_config": {
             "num_variables": commitment.num_variables,
@@ -1222,18 +1338,19 @@ where
         // Goldilocks prime: 2^64 - 2^32 + 1
         const GL_P: u64 = 0xFFFFFFFF00000001u64;
 
-        // Base material: WHIR transcript bytes (contains Merkle root)
+        // Derive challenges from Merkle root (v2) — matches on-chain deriveKeccakChallengesV2.
+        // The Merkle root is the first 32 bytes of the WHIR transcript.
         let transcript_bytes = &proof.combined_whir.proof_narg;
+        let merkle_root = &transcript_bytes[0..32];
         let mut h = Keccak256::new();
-        h.update(b"plonky2-keccak-challenges");
-        h.update(transcript_bytes);
-        // Also bind to public inputs
+        h.update(b"plonky2-challenges-v2");
+        h.update(proof.combined_whir.session_name.as_bytes());
+        h.update(merkle_root);
         for &pi in &proof.standard_proof.public_inputs {
             h.update(&pi.to_canonical_u64().to_le_bytes());
         }
 
         // Squeeze challenges in sequence: betas, gammas, alphas, zeta
-        // Using a running Keccak state (same pattern as sumcheck)
         let mut state = h.finalize().to_vec();
 
         let mut squeeze_u64 = || -> u64 {
@@ -1276,33 +1393,8 @@ where
     // k_is for permutation
     let k_is: Vec<u64> = common.k_is.iter().map(|k| k.to_canonical_u64()).collect();
 
-    // Helper to serialize Vec<Field64_3> as flat [c0,c1,c2, c0,c1,c2, ...]
-    let ext3_vec_to_flat = |v: &[Field64_3]| -> Vec<u64> {
-        use ark_ff::PrimeField as ArkPF;
-        v.iter().flat_map(|e| {
-            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
-            vec![
-                base[0].into_bigint().0[0],
-                base[1].into_bigint().0[0],
-                base[2].into_bigint().0[0],
-            ]
-        }).collect()
-    };
-
-    // Use Ext3 openings if available (unified ζ), otherwise fall back to Ext2
-    let openings_json = if let Some(ref ext3) = proof.ext3_openings {
-        serde_json::json!({
-            "constants": ext3_vec_to_flat(&ext3.constants),
-            "plonkSigmas": ext3_vec_to_flat(&ext3.plonk_sigmas),
-            "wires": ext3_vec_to_flat(&ext3.wires),
-            "plonkZs": ext3_vec_to_flat(&ext3.plonk_zs),
-            "plonkZsNext": ext3_vec_to_flat(&ext3.plonk_zs_next),
-            "partialProducts": ext3_vec_to_flat(&ext3.partial_products),
-            "quotientPolys": ext3_vec_to_flat(&ext3.quotient_polys),
-            "extensionDegree": 3,
-        })
-    } else {
-        serde_json::json!({
+    serde_json::json!({
+        "openings": {
             "constants": ext_vec_to_flat(&openings.constants),
             "plonkSigmas": ext_vec_to_flat(&openings.plonk_sigmas),
             "wires": ext_vec_to_flat(&openings.wires),
@@ -1310,20 +1402,12 @@ where
             "plonkZsNext": ext_vec_to_flat(&openings.plonk_zs_next),
             "partialProducts": ext_vec_to_flat(&openings.partial_products),
             "quotientPolys": ext_vec_to_flat(&openings.quotient_polys),
-            "extensionDegree": 2,
-        })
-    };
-
-    // plonkZeta: Ext3 from Keccak challenge derivation
-    let plonk_zeta_json = serde_json::json!([zeta_c0, zeta_c1, zeta_c2]);
-
-    serde_json::json!({
-        "openings": openings_json,
+        },
         "challenges": {
             "plonkBetas": keccak_betas,
             "plonkGammas": keccak_gammas,
             "plonkAlphas": keccak_alphas,
-            "plonkZeta": plonk_zeta_json,
+            "plonkZeta": [zeta_c0, zeta_c1, zeta_c2],
         },
         "circuitParams": {
             "degreeBits": common.degree_bits(),
@@ -1344,6 +1428,33 @@ where
             .collect::<Vec<_>>(),
         "batchSizes": proof.batch_sizes,
         "batchEvalsAtZeta": proof.batch_evals_at_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
+        "batchEvalsAtGZeta": proof.batch_evals_at_g_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
+        "intraBatchPolyCounts": proof.intra_batch_poly_counts,
+        "intraBatchEvalsAtZeta": proof.intra_batch_evals_at_zeta.iter().map(|batch_evals| {
+            batch_evals.iter().map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                serde_json::json!({
+                    "c0": base[0].into_bigint().0[0],
+                    "c1": base[1].into_bigint().0[0],
+                    "c2": base[2].into_bigint().0[0],
+                })
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>(),
+        "batch2EvalsAtGZeta": proof.batch2_evals_at_g_zeta.iter().map(|e| {
             let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
             serde_json::json!({
                 "c0": base[0].into_bigint().0[0],

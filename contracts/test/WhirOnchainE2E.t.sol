@@ -5,7 +5,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {SpongefishWhirVerify} from "../src/spongefish/SpongefishWhirVerify.sol";
 import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
 import {Plonky2Verifier} from "../src/Plonky2Verifier.sol";
-import {GoldilocksExt2} from "../src/GoldilocksField.sol";
+import {GoldilocksField} from "../src/GoldilocksField.sol";
 
 /// @title WhirOnchainE2ETest
 /// @notice Complete E2E test: validity proof → WrapperCircuit → WHIR → on-chain verify
@@ -22,7 +22,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     /// @notice WHIR polynomial commitment: combined (all 4 batches concatenated)
     function test_whir_wrapper_combined() public view {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
+            string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
         );
         _verifyWhirCommitment(json, "combined");
     }
@@ -35,7 +35,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     ///         Calls Plonky2Verifier.verifyConstraints with real openings/challenges.
     function test_plonky2_constraints_wrapper() public {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/test_constraint_data.json")
+            string.concat(vm.projectRoot(), "/test/data/wrapper_constraint_data.json")
         );
         _verifyPlonky2Constraints(json);
     }
@@ -52,7 +52,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         // --- Combined WHIR verification (all 4 batches in 1 proof) ---
         {
             string memory json = vm.readFile(
-                string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
+                string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
             );
             gasBefore = gasleft();
             _verifyWhirCommitment(json, "combined");
@@ -63,7 +63,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         // --- Plonky2 constraint verification ---
         {
             string memory json = vm.readFile(
-                string.concat(vm.projectRoot(), "/test/data/test_constraint_data.json")
+                string.concat(vm.projectRoot(), "/test/data/wrapper_constraint_data.json")
             );
             _verifyPlonky2Constraints(json);
         }
@@ -76,7 +76,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
     /// @notice Measure pure verifyWhirProof gas for the combined proof (excludes JSON parsing).
     function test_gas_pure_whir_verification() public {
         string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/test/data/whir/test_combined_verifier_data.json")
+            string.concat(vm.projectRoot(), "/test/data/whir/wrapper_combined_verifier_data.json")
         );
 
         // --- Parse all data BEFORE gas measurement ---
@@ -174,7 +174,7 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         challenges.plonkAlphas = abi.decode(vm.parseJson(json, ".challenges.plonkAlphas"), (uint256[]));
         {
             uint256[] memory zetaFlat = abi.decode(vm.parseJson(json, ".challenges.plonkZeta"), (uint256[]));
-            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat.length > 2 ? zetaFlat[2] : 0));
+            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat[2]));
         }
 
         Plonky2Verifier.PermutationData memory permData;
@@ -244,11 +244,13 @@ contract WhirOnchainE2ETest is Test, Plonky2Verifier {
         return abi.decode(vm.parseJson(json, path), (uint256));
     }
 
+    /// @dev Convert flat u64 array [c0, c1, c0, c1, ...] (Ext2 format) to Ext3 with c2=0.
+    /// TODO: When the Rust exporter outputs Ext3 triplets [c0, c1, c2, ...], update to read 3 per element.
     function _flatToExt3(uint256[] memory flat) internal pure returns (GoldilocksExt3.Ext3[] memory) {
-        uint256 len = flat.length / 3;
+        uint256 len = flat.length / 2;
         GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 2]), uint64(flat[i * 2 + 1]), 0);
         }
         return result;
     }

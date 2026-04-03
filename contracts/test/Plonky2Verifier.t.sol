@@ -9,16 +9,12 @@ import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
 /// @title Plonky2VerifierTest — E2E test using real Plonky2 proof data
 /// @dev Loads opening values, challenges, and circuit params exported from Rust
 ///      and verifies that the Plonky2 constraint checker accepts a valid proof.
-///
-///      NOTE: After the Ext2→Ext3 conversion, these tests require new fixture data
-///      with 3-component extension field elements. They are expected to fail until
-///      new Ext3-format fixtures are generated from Rust.
 contract Plonky2VerifierTest is Test, Plonky2Verifier {
 
     /// @dev Load fixture data and call verifyConstraints
     function test_verifyConstraints_validProof() public {
         // Read fixture JSON
-        string memory json = vm.readFile("test/data/test_constraint_data.json");
+        string memory json = vm.readFile("test/data/whir_constraint_data.json");
 
         // Parse circuit params
         Plonky2Verifier.CircuitParams memory params;
@@ -47,7 +43,7 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
         challenges.plonkGammas = _parseU256Array(json, ".challenges.plonkGammas", 2);
         challenges.plonkAlphas = _parseU256Array(json, ".challenges.plonkAlphas", 2);
         {
-            uint256[] memory zetaFlat = _parseU256Array(json, ".challenges.plonkZeta", 3);
+            uint256[] memory zetaFlat = _parseU256Array(json, ".challenges.plonkZeta", 2);
             challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat[2]));
         }
 
@@ -82,13 +78,14 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
     // JSON parsing helpers
     // -----------------------------------------------------------------------
 
-    /// @dev Parse Ext3 array from flattened [c0_0, c1_0, c2_0, c0_1, c1_1, c2_1, ...] string array.
+    /// @dev Parse Ext3 array from flattened [c0_0, c1_0, c0_1, c1_1, ...] (Ext2 format) string array.
+    /// TODO: When the Rust exporter outputs Ext3 triplets [c0, c1, c2, ...], update to read 3 per element.
     function _parseExt3Array(string memory json, string memory key, uint256 len) internal pure returns (GoldilocksExt3.Ext3[] memory) {
-        // Parse flat string array: [c0_0, c1_0, c2_0, c0_1, c1_1, c2_1, ...]
-        uint256[] memory flat = _parseU256Array(json, key, len * 3);
+        // Parse flat string array: [c0_0, c1_0, c0_1, c1_1, ...] — Ext2 format, c2=0
+        uint256[] memory flat = _parseU256Array(json, key, len * 2);
         GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 2]), uint64(flat[i * 2 + 1]), 0);
         }
         return result;
     }
@@ -142,7 +139,7 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
         Plonky2Verifier.GateInfo[] memory gates,
         uint256[] memory publicInputs
     ) {
-        string memory json = vm.readFile("test/data/test_constraint_data.json");
+        string memory json = vm.readFile("test/data/whir_constraint_data.json");
         params.degreeBits = abi.decode(vm.parseJson(json, ".circuitParams.degreeBits"), (uint256));
         params.numChallenges = abi.decode(vm.parseJson(json, ".circuitParams.numChallenges"), (uint256));
         params.numRoutedWires = abi.decode(vm.parseJson(json, ".circuitParams.numRoutedWires"), (uint256));
@@ -161,7 +158,7 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
         challenges.plonkBetas = _parseU256Array(json, ".challenges.plonkBetas", 2);
         challenges.plonkGammas = _parseU256Array(json, ".challenges.plonkGammas", 2);
         challenges.plonkAlphas = _parseU256Array(json, ".challenges.plonkAlphas", 2);
-        { uint256[] memory z = _parseU256Array(json, ".challenges.plonkZeta", 3); challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(z[0]), uint64(z[1]), uint64(z[2])); }
+        { uint256[] memory z = _parseU256Array(json, ".challenges.plonkZeta", 2); challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(z[0]), uint64(z[1]), 0); }
         permData.kIs = _parseU256Array(json, ".permutation.kIs", 80);
         gates = _parseGates(json, 4);
         publicInputs = _parseU256Array(json, ".publicInputs", 8);
@@ -201,7 +198,7 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
     ///      This fixture contains all 13 gate types (including ArithmeticExtension,
     ///      RandomAccess, Reducing, MulExtension, CosetInterpolation, etc.)
     function test_verifyConstraints_wrapperCircuit() public {
-        string memory json = vm.readFile("test/data/test_constraint_data.json");
+        string memory json = vm.readFile("test/data/wrapper_constraint_data.json");
 
         CircuitParams memory params;
         params.degreeBits = abi.decode(vm.parseJson(json, ".circuitParams.degreeBits"), (uint256));
@@ -236,7 +233,7 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
         challenges.plonkGammas = _parseU256Array(json, ".challenges.plonkGammas", 2);
         challenges.plonkAlphas = _parseU256Array(json, ".challenges.plonkAlphas", 2);
         {
-            uint256[] memory zetaFlat = _parseU256Array(json, ".challenges.plonkZeta", 3);
+            uint256[] memory zetaFlat = _parseU256Array(json, ".challenges.plonkZeta", 2);
             challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat[2]));
         }
 
@@ -258,12 +255,13 @@ contract Plonky2VerifierTest is Test, Plonky2Verifier {
         assertTrue(result, "WrapperCircuit constraint verification should pass");
     }
 
-    /// @dev Convert flat u64 array [c0, c1, c2, c0, c1, c2, ...] to Ext3 array
+    /// @dev Convert flat u64 array [c0, c1, c0, c1, ...] (Ext2 format) to Ext3 with c2=0.
+    /// TODO: When the Rust exporter outputs Ext3 triplets [c0, c1, c2, ...], update to read 3 per element.
     function _flatToExt3(uint256[] memory flat) internal pure returns (GoldilocksExt3.Ext3[] memory) {
-        uint256 len = flat.length / 3;
+        uint256 len = flat.length / 2;
         GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 2]), uint64(flat[i * 2 + 1]), 0);
         }
         return result;
     }

@@ -47,10 +47,14 @@ library SpongefishWhirVerify {
         uint256 initialNumVariables;
         uint256 initialCosetSize;
         uint256 initialNumCosets;
-        // Evaluation point (for FinalClaim).
+        // Evaluation point(s) (for FinalClaim).
         // If empty, uses canonical point (1, 2, ..., numVariables).
-        // With sumcheck bridge, this is the sumcheck-derived point r.
+        // With sumcheck bridge, this is the sumcheck-derived point r₁.
         GoldilocksExt3.Ext3[] evaluationPoint;
+        // Second evaluation point (for dual-point / gζ bridge).
+        // If empty, single-point mode (numLinearForms = 1).
+        // With dual bridge, this is the sumcheck-derived point r₂ for gζ.
+        GoldilocksExt3.Ext3[] evaluationPoint2;
         // Per-round params (array of length numRounds)
         RoundParams[] rounds;
     }
@@ -380,57 +384,56 @@ library SpongefishWhirVerify {
             }
         }
 
-        // Sum initial constraint RLC coefficients
-        GoldilocksExt3.Ext3 memory initialLinearFormRlcSum = GoldilocksExt3.zero();
-        {
-            GoldilocksExt3.Ext3[] memory icRlc = vs.initialConstraintRlc;
-            uint256 nLF = vs.numLinearForms;
-            assembly {
-                let p := 0xFFFFFFFF00000001
-                let s0 := 0
-                let s1 := 0
-                let s2 := 0
-                let icData := add(icRlc, 0x20)
-                for { let i := 0 } lt(i, nLF) { i := add(i, 1) } {
-                    let ePtr := mload(add(icData, mul(i, 0x20)))
-                    s0 := addmod(s0, mload(ePtr), p)
-                    s1 := addmod(s1, mload(add(ePtr, 0x20)), p)
-                    s2 := addmod(s2, mload(add(ePtr, 0x40)), p)
-                }
-                mstore(initialLinearFormRlcSum, s0)
-                mstore(add(initialLinearFormRlcSum, 0x20), s1)
-                mstore(add(initialLinearFormRlcSum, 0x40), s2)
+        // Compute expectedRlc = Σ rlc[i] * eq(point_i, foldingRandomness)
+        // For single-point: expectedRlc = rlc[0] * eq(point1, folding)
+        // For dual-point:   expectedRlc = rlc[0] * eq(point1, folding) + rlc[1] * eq(point2, folding)
+        GoldilocksExt3.Ext3 memory expectedRlc = GoldilocksExt3.zero();
+
+        if (vs.numLinearForms == 1) {
+            // Single-point mode (original behavior)
+            GoldilocksExt3.Ext3 memory eqVal;
+            if (params.evaluationPoint.length > 0) {
+                eqVal = WhirLinearAlgebra.mleEvaluateEq(
+                    params.evaluationPoint, vs.allFoldingRandomness
+                );
+            } else {
+                eqVal = WhirLinearAlgebra.mleEvaluateEqCanonical(
+                    params.numVariables, vs.allFoldingRandomness
+                );
+            }
+            expectedRlc = vs.initialConstraintRlc[0].mul(eqVal);
+        } else {
+            // Multi-point mode: each linear form has its own evaluation point
+            // point 1: evaluationPoint, point 2: evaluationPoint2
+            GoldilocksExt3.Ext3 memory eqVal1;
+            if (params.evaluationPoint.length > 0) {
+                eqVal1 = WhirLinearAlgebra.mleEvaluateEq(
+                    params.evaluationPoint, vs.allFoldingRandomness
+                );
+            } else {
+                eqVal1 = WhirLinearAlgebra.mleEvaluateEqCanonical(
+                    params.numVariables, vs.allFoldingRandomness
+                );
+            }
+            expectedRlc = vs.initialConstraintRlc[0].mul(eqVal1);
+
+            // Add contribution from second evaluation point
+            if (vs.numLinearForms >= 2 && params.evaluationPoint2.length > 0) {
+                GoldilocksExt3.Ext3 memory eqVal2 = WhirLinearAlgebra.mleEvaluateEq(
+                    params.evaluationPoint2, vs.allFoldingRandomness
+                );
+                expectedRlc = expectedRlc.add(vs.initialConstraintRlc[1].mul(eqVal2));
+            }
+
+            // Handle any additional linear forms beyond 2 (future-proof)
+            for (uint256 i = 2; i < vs.numLinearForms; i++) {
+                // Additional linear forms would need additional evaluation points
+                // For now, this path is unused
+                revert("more than 2 linear forms not yet supported");
             }
         }
 
-        // expectedRlc = eq(evaluationPoint, foldingRandomness) * initialLinearFormRlcSum
-        // Use actual evaluation point if provided, otherwise canonical (1, 2, ..., n)
-        GoldilocksExt3.Ext3 memory eqVal;
-        if (params.evaluationPoint.length > 0) {
-            eqVal = WhirLinearAlgebra.mleEvaluateEq(
-                params.evaluationPoint, vs.allFoldingRandomness
-            );
-        } else {
-            eqVal = WhirLinearAlgebra.mleEvaluateEqCanonical(
-                params.numVariables, vs.allFoldingRandomness
-            );
-        }
-        // Multiply in-place
-        assembly {
-            let p := 0xFFFFFFFF00000001
-            let a0 := mload(eqVal)
-            let a1 := mload(add(eqVal, 0x20))
-            let a2 := mload(add(eqVal, 0x40))
-            let b0 := mload(initialLinearFormRlcSum)
-            let b1 := mload(add(initialLinearFormRlcSum, 0x20))
-            let b2 := mload(add(initialLinearFormRlcSum, 0x40))
-            let t := addmod(mulmod(a1, b2, p), mulmod(a2, b1, p), p)
-            mstore(eqVal, addmod(mulmod(a0, b0, p), mulmod(2, t, p), p))
-            mstore(add(eqVal, 0x20), addmod(addmod(mulmod(a0, b1, p), mulmod(a1, b0, p), p), mulmod(2, mulmod(a2, b2, p), p), p))
-            mstore(add(eqVal, 0x40), addmod(addmod(mulmod(a0, b2, p), mulmod(a1, b1, p), p), mulmod(a2, b0, p), p))
-        }
-
-        require(GoldilocksExt3.eq(linearFormRlc, eqVal), "FinalClaim: linear form mismatch");
+        require(GoldilocksExt3.eq(linearFormRlc, expectedRlc), "FinalClaim: linear form mismatch");
     }
 
     // =====================================================================

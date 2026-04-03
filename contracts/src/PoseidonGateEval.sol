@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "./GoldilocksField.sol";
 import "./PoseidonConstants.sol";
-import {GoldilocksExt3} from "./spongefish/GoldilocksExt3.sol";
+import "./spongefish/GoldilocksExt3.sol";
 
 /// @title PoseidonGateEval — Evaluate PoseidonGate constraints at ζ (extension field)
 /// @dev All arithmetic uses GoldilocksExt3 since the challenge point ζ is in F_p^3.
@@ -56,9 +56,9 @@ library PoseidonGateEval {
             GoldilocksExt3.Ext3 memory acc = GoldilocksExt3.zero();
             for (uint256 i = 0; i < 12; i++) {
                 uint256 idx = (i + r) % 12;
-                acc = acc.add(GoldilocksExt3.mulScalarU256(state[idx], PoseidonConstants.mdsCirc(i)));
+                acc = acc.add(state[idx].mulScalar(uint64(PoseidonConstants.mdsCirc(i))));
             }
-            acc = acc.add(GoldilocksExt3.mulScalarU256(state[r], PoseidonConstants.mdsDiag(r)));
+            acc = acc.add(state[r].mulScalar(uint64(PoseidonConstants.mdsDiag(r))));
             result[r] = acc;
         }
         return result;
@@ -71,13 +71,13 @@ library PoseidonGateEval {
         GoldilocksExt3.Ext3[12] memory result;
         // d = state[0] * M_00 + sum_{i=1..11} state[i] * wHat[r][i-1]
         uint256 m00 = PoseidonConstants.mdsCirc(0) + PoseidonConstants.mdsDiag(0); // 17 + 8 = 25
-        GoldilocksExt3.Ext3 memory d = GoldilocksExt3.mulScalarU256(state[0], m00);
+        GoldilocksExt3.Ext3 memory d = state[0].mulScalar(uint64(m00));
         for (uint256 i = 1; i < 12; i++) {
-            d = d.add(GoldilocksExt3.mulScalarU256(state[i], PoseidonConstants.wHat(r, i - 1)));
+            d = d.add(state[i].mulScalar(uint64(PoseidonConstants.wHat(r, i - 1))));
         }
         result[0] = d;
         for (uint256 i = 1; i < 12; i++) {
-            result[i] = GoldilocksExt3.mulScalarU256(state[0], PoseidonConstants.vs(r, i - 1)).add(state[i]);
+            result[i] = state[0].mulScalar(uint64(PoseidonConstants.vs(r, i - 1))).add(state[i]);
         }
         return result;
     }
@@ -91,7 +91,7 @@ library PoseidonGateEval {
         for (uint256 c = 1; c < 12; c++) {
             GoldilocksExt3.Ext3 memory acc = GoldilocksExt3.zero();
             for (uint256 r = 1; r < 12; r++) {
-                acc = acc.add(GoldilocksExt3.mulScalarU256(state[r], PoseidonConstants.initialMatrix(r - 1, c - 1)));
+                acc = acc.add(state[r].mulScalar(uint64(PoseidonConstants.initialMatrix(r - 1, c - 1))));
             }
             result[c] = acc;
         }
@@ -101,8 +101,8 @@ library PoseidonGateEval {
     /// @dev Add round constants to Ext3 state (constants are base field)
     function _constantLayer(GoldilocksExt3.Ext3[12] memory state, uint256 roundCtr) private pure {
         for (uint256 i = 0; i < 12; i++) {
-            state[i] = state[i].add(GoldilocksExt3.fromBaseU256(
-                PoseidonConstants.roundConstant(i + 12 * roundCtr)
+            state[i] = state[i].add(GoldilocksExt3.fromBase(
+                uint64(PoseidonConstants.roundConstant(i + 12 * roundCtr))
             ));
         }
     }
@@ -171,8 +171,8 @@ library PoseidonGateEval {
 
         // ---- Partial rounds ----
         for (uint256 i = 0; i < 12; i++) {
-            state[i] = state[i].add(GoldilocksExt3.fromBaseU256(
-                PoseidonConstants.fastPartialFirstRoundConstant(i)
+            state[i] = state[i].add(GoldilocksExt3.fromBase(
+                uint64(PoseidonConstants.fastPartialFirstRoundConstant(i))
             ));
         }
         state = _mdsPartialLayerInit(state);
@@ -181,8 +181,8 @@ library PoseidonGateEval {
             constraints[cidx++] = state[0].sub(wires[_wirePartialSbox(r)]);
             state[0] = _sbox(wires[_wirePartialSbox(r)]);
             if (r < N_PARTIAL - 1) {
-                state[0] = state[0].add(GoldilocksExt3.fromBaseU256(
-                    PoseidonConstants.fastPartialRoundConstant(r)
+                state[0] = state[0].add(GoldilocksExt3.fromBase(
+                    uint64(PoseidonConstants.fastPartialRoundConstant(r))
                 ));
             }
             state = _mdsPartialLayerFast(state, r);

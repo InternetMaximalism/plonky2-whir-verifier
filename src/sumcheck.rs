@@ -331,6 +331,22 @@ pub fn eval_univariate_via_mle(coeffs: &[Field64], zeta: Field64_3) -> Field64_3
     sum
 }
 
+/// Evaluate a univariate polynomial p(x) = Σ_{i=0}^{N-1} c_i · x^i at point ζ,
+/// where the polynomial is padded to exactly `degree` coefficients.
+///
+/// This is used for intra-batch sub-decomposition: evaluating individual
+/// polynomials within a batch at the sumcheck bridge evaluation point.
+pub fn eval_univariate_via_mle_raw(coeffs: &[Field64], zeta: Field64_3, degree: usize) -> Field64_3 {
+    let mut sum = Field64_3::ZERO;
+    let mut zeta_power = Field64_3::ONE;
+    for i in 0..degree {
+        let c = if i < coeffs.len() { coeffs[i] } else { Field64::ZERO };
+        sum += base_to_ext3(c) * zeta_power;
+        zeta_power *= zeta;
+    }
+    sum
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

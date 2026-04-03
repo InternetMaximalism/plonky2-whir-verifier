@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/PoseidonGateEval.sol";
 import "../src/PoseidonConstants.sol";
 import "../src/GoldilocksField.sol";
-import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
+import "../src/spongefish/GoldilocksExt3.sol";
 
 contract PoseidonGateEvalTest is Test {
     /// @dev Test round constants match Plonky2
@@ -36,7 +36,7 @@ contract PoseidonGateEvalTest is Test {
         PoseidonGateEval.evaluateExt3(wires);
         uint256 gasUsed = gasBefore - gasleft();
         emit log_named_uint("PoseidonGate Ext3 evaluate gas", gasUsed);
-        // Ext3 version should be under 750K gas (more ops than Ext2)
+        // Ext3 version may use more gas than Ext2
         assertLt(gasUsed, 750_000);
     }
 

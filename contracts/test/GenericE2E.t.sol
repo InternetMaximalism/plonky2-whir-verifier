@@ -6,7 +6,7 @@ import {SpongefishWhirVerify} from "../src/spongefish/SpongefishWhirVerify.sol";
 import {GoldilocksExt3} from "../src/spongefish/GoldilocksExt3.sol";
 import {SumcheckBridgeVerifier} from "../src/spongefish/SumcheckBridgeVerifier.sol";
 import {Plonky2Verifier} from "../src/Plonky2Verifier.sol";
-import {GoldilocksField, GoldilocksExt2} from "../src/GoldilocksField.sol";
+import {GoldilocksField} from "../src/GoldilocksField.sol";
 
 /// @title GenericE2ETest
 /// @notice E2E test using a generic Poseidon hash-chain circuit (no intmax3 dependency).
@@ -40,39 +40,58 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         string memory whirJson = vm.readFile("test/data/whir/test_combined_verifier_data.json");
         string memory constraintJson = vm.readFile("test/data/test_constraint_data.json");
 
-        // 1. WHIR polynomial commitment verification
-        {
-            uint256 gasBefore = gasleft();
-            _verifyWhirCommitment(whirJson);
-            console.log("WHIR combined gas:", gasBefore - gasleft());
-        }
+        // =====================================================================
+        // Step 1: WHIR polynomial commitment verification (dual-point)
+        // Proves: committed polynomial evaluates to f(r₁) and f(r₂) at
+        //         sumcheck-derived points r₁ (for ζ) and r₂ (for gζ).
+        // =====================================================================
+        _verifyWhirCommitment(whirJson);
+        console.log("[e2e] Step 1: WHIR dual-point verification PASSED");
 
-        // 2. Sumcheck bridge — binding between WHIR commitment and constraint openings
-        {
-            uint256 gasBefore = gasleft();
-            _verifySumcheckBridge(whirJson);
-            console.log("Sumcheck bridge gas:", gasBefore - gasleft());
-        }
+        // =====================================================================
+        // Step 2: Sumcheck bridge #1 (ζ) — binding WHIR to P(ζ)
+        // Proves: ⟨f, h_ζ⟩ = P(ζ)  where f is the WHIR-committed polynomial
+        // =====================================================================
+        _verifySumcheckBridge(whirJson);
+        console.log("[e2e] Step 2: Sumcheck bridge #1 (zeta) PASSED");
 
-        // 3. On-chain challenge re-derivation (Keccak)
-        {
-            uint256 gasBefore = gasleft();
-            _verifyChallengeDerivation(whirJson, constraintJson);
-            console.log("Challenge derivation gas:", gasBefore - gasleft());
-        }
+        // =====================================================================
+        // Step 3: Sumcheck bridge #2 (gζ) — binding WHIR to P(gζ)
+        // Proves: ⟨f, h_{gζ}⟩ = P(gζ)
+        // =====================================================================
+        _verifySumcheckBridgeGZeta(whirJson);
+        console.log("[e2e] Step 3: Sumcheck bridge #2 (g*zeta) PASSED");
 
-        // 4. Opening decomposition check
-        {
-            uint256 gasBefore = gasleft();
-            _verifyDecomposition(whirJson, constraintJson);
-            console.log("Decomposition gas:", gasBefore - gasleft());
-        }
+        // =====================================================================
+        // Step 4: On-chain challenge derivation (from Merkle root)
+        // Derives: betas, gammas, alphas, zeta — all bound to WHIR commitment
+        // =====================================================================
+        bytes memory transcript = vm.parseJsonBytes(whirJson, ".transcript");
+        string memory sessionName = abi.decode(vm.parseJson(whirJson, ".session_name"), (string));
+        uint256[] memory publicInputs = abi.decode(vm.parseJson(constraintJson, ".publicInputs"), (uint256[]));
+        uint256 numChallenges = _u(constraintJson, ".circuitParams.numChallenges");
 
-        // 5. Plonky2 constraints
+        (
+            uint256[] memory betas,
+            uint256[] memory gammas,
+            uint256[] memory alphas,
+            uint256 zetaC0,
+            uint256 zetaC1,
+            uint256 zetaC2
+        ) = SumcheckBridgeVerifier.deriveKeccakChallengesV2(
+            transcript, bytes(sessionName), publicInputs, numChallenges
+        );
+        console.log("[e2e] Step 4: On-chain challenge derivation DONE");
+
+        // Steps 5-10: Decomposition, sub-decomposition, and constraint check
+        // Split into separate function to avoid stack-too-deep
         {
-            uint256 gasBefore = gasleft();
-            _verifyPlonky2Constraints(constraintJson);
-            console.log("Plonky2 constraints gas:", gasBefore - gasleft());
+            Challenges memory chal;
+            chal.plonkBetas = betas;
+            chal.plonkGammas = gammas;
+            chal.plonkAlphas = alphas;
+            chal.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaC0), uint64(zetaC1), uint64(zetaC2));
+            _verifyDecompositionAndConstraints(whirJson, constraintJson, chal, publicInputs);
         }
     }
 
@@ -239,10 +258,11 @@ contract GenericE2ETest is Test, Plonky2Verifier {
 
     function _verifyChallengeDerivation(string memory whirJson, string memory constraintJson) internal pure {
         bytes memory transcript = vm.parseJsonBytes(whirJson, ".transcript");
+        string memory sessionName = abi.decode(vm.parseJson(whirJson, ".session_name"), (string));
         uint256[] memory publicInputs = abi.decode(vm.parseJson(constraintJson, ".publicInputs"), (uint256[]));
         uint256 numChallenges = _u(constraintJson, ".circuitParams.numChallenges");
 
-        // Derive challenges on-chain
+        // Derive challenges on-chain (v2: from Merkle root instead of full transcript)
         (
             uint256[] memory betas,
             uint256[] memory gammas,
@@ -250,7 +270,9 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             uint256 zetaC0,
             uint256 zetaC1,
             uint256 zetaC2
-        ) = SumcheckBridgeVerifier.deriveKeccakChallenges(transcript, publicInputs, numChallenges);
+        ) = SumcheckBridgeVerifier.deriveKeccakChallengesV2(
+            transcript, bytes(sessionName), publicInputs, numChallenges
+        );
 
         // Compare with fixture values
         uint256[] memory expectedBetas = abi.decode(vm.parseJson(constraintJson, ".challenges.plonkBetas"), (uint256[]));
@@ -317,12 +339,16 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         bytes memory transcript = vm.parseJsonBytes(json, ".transcript");
         bytes memory hints = vm.parseJsonBytes(json, ".hints");
 
-        GoldilocksExt3.Ext3[] memory evaluations = new GoldilocksExt3.Ext3[](1);
-        {
-            uint64 c0 = uint64(abi.decode(vm.parseJson(json, ".evaluations[0].c0"), (uint256)));
-            uint64 c1 = uint64(abi.decode(vm.parseJson(json, ".evaluations[0].c1"), (uint256)));
-            uint64 c2 = uint64(abi.decode(vm.parseJson(json, ".evaluations[0].c2"), (uint256)));
-            evaluations[0] = GoldilocksExt3.Ext3(c0, c1, c2);
+        // Load all evaluations (1 for single-point, 2 for dual-point with gζ bridge)
+        uint256 numEvals = 2; // dual-point mode
+        GoldilocksExt3.Ext3[] memory evaluations = new GoldilocksExt3.Ext3[](numEvals);
+        for (uint256 i = 0; i < numEvals; i++) {
+            string memory prefix = string.concat(".evaluations[", vm.toString(i), "].");
+            evaluations[i] = GoldilocksExt3.Ext3(
+                uint64(_u(json, string.concat(prefix, "c0"))),
+                uint64(_u(json, string.concat(prefix, "c1"))),
+                uint64(_u(json, string.concat(prefix, "c2")))
+            );
         }
 
         SpongefishWhirVerify.WhirParams memory params = _loadParams(json);
@@ -357,6 +383,8 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         uint256[] memory qpFlat = abi.decode(vm.parseJson(json, ".openings.quotientPolys"), (uint256[]));
 
         Openings memory openings;
+        // TODO: Fixture JSON still stores openings as flat Ext2 pairs [c0, c1, ...].
+        // When the Rust exporter is updated for Ext3, switch _flatToExt3 to read triplets.
         openings.constants = _flatToExt3(constFlat);
         openings.plonkSigmas = _flatToExt3(sigmaFlat);
         openings.wires = _flatToExt3(wiresFlat);
@@ -371,7 +399,7 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         challenges.plonkAlphas = abi.decode(vm.parseJson(json, ".challenges.plonkAlphas"), (uint256[]));
         {
             uint256[] memory zetaFlat = abi.decode(vm.parseJson(json, ".challenges.plonkZeta"), (uint256[]));
-            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat.length > 2 ? zetaFlat[2] : 0));
+            challenges.plonkZeta = GoldilocksExt3.Ext3(uint64(zetaFlat[0]), uint64(zetaFlat[1]), uint64(zetaFlat[2]));
         }
 
         PermutationData memory permData;
@@ -384,6 +412,166 @@ contract GenericE2ETest is Test, Plonky2Verifier {
 
         bool valid = verifyConstraints(openings, params, challenges, permData, gates, publicInputs);
         assertTrue(valid, "Plonky2 constraint verification must pass");
+    }
+
+    // =====================================================================
+    // Internal: Full decomposition + constraint verification (Steps 5-10)
+    // Split from test_full_e2e to avoid stack-too-deep.
+    // =====================================================================
+
+    function _verifyDecompositionAndConstraints(
+        string memory whirJson,
+        string memory constraintJson,
+        Challenges memory chal,
+        uint256[] memory publicInputs
+    ) internal {
+        uint256 numChallenges = chal.plonkBetas.length;
+        // Step 5: Inter-batch decomposition at ζ
+        GoldilocksExt3.Ext3 memory zetaExt3 = GoldilocksExt3.Ext3(
+            uint64(_u(whirJson, ".sumcheck.zeta.c0")),
+            uint64(_u(whirJson, ".sumcheck.zeta.c1")),
+            uint64(_u(whirJson, ".sumcheck.zeta.c2"))
+        );
+        uint256[] memory batchSizes = abi.decode(vm.parseJson(constraintJson, ".batchSizes"), (uint256[]));
+        uint256 nBatches = batchSizes.length;
+        GoldilocksExt3.Ext3[] memory batchEvalsZeta = _parseExt3Array(constraintJson, ".batchEvalsAtZeta", nBatches);
+        {
+            GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+                uint64(_u(whirJson, ".sumcheck.claimed_sum.c0")),
+                uint64(_u(whirJson, ".sumcheck.claimed_sum.c1")),
+                uint64(_u(whirJson, ".sumcheck.claimed_sum.c2"))
+            );
+            SumcheckBridgeVerifier.verifyDecomposition(claimedSum, batchSizes, zetaExt3, batchEvalsZeta);
+        }
+        console.log("[e2e] Step 5: Inter-batch decomposition (zeta) PASSED");
+
+        // Step 6: Inter-batch decomposition at gζ
+        GoldilocksExt3.Ext3 memory gZetaExt3 = GoldilocksExt3.Ext3(
+            uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c0")),
+            uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c1")),
+            uint64(_u(whirJson, ".sumcheck_g_zeta.g_zeta.c2"))
+        );
+        GoldilocksExt3.Ext3[] memory batchEvalsGZ = _parseExt3Array(constraintJson, ".batchEvalsAtGZeta", nBatches);
+        {
+            GoldilocksExt3.Ext3 memory claimedSumGZ = GoldilocksExt3.Ext3(
+                uint64(_u(whirJson, ".sumcheck_g_zeta.claimed_sum.c0")),
+                uint64(_u(whirJson, ".sumcheck_g_zeta.claimed_sum.c1")),
+                uint64(_u(whirJson, ".sumcheck_g_zeta.claimed_sum.c2"))
+            );
+            SumcheckBridgeVerifier.verifyDecomposition(claimedSumGZ, batchSizes, gZetaExt3, batchEvalsGZ);
+        }
+        console.log("[e2e] Step 6: Inter-batch decomposition (g*zeta) PASSED");
+
+        // Step 7: Intra-batch sub-decomposition at ζ (all 4 batches)
+        uint256[] memory polyCounts = abi.decode(vm.parseJson(constraintJson, ".intraBatchPolyCounts"), (uint256[]));
+        uint256 polyDegree = 1 << _u(constraintJson, ".circuitParams.degreeBits");
+        for (uint256 b = 0; b < nBatches; b++) {
+            GoldilocksExt3.Ext3[] memory polyEvals = _parseExt3Array(
+                constraintJson,
+                string.concat(".intraBatchEvalsAtZeta[", vm.toString(b), "]"),
+                polyCounts[b]
+            );
+            SumcheckBridgeVerifier.verifySubDecomposition(batchEvalsZeta[b], polyDegree, zetaExt3, polyEvals);
+        }
+        console.log("[e2e] Step 7: Intra-batch sub-decomposition (zeta) PASSED");
+
+        // Step 8: Intra-batch sub-decomposition of batch 2 at gζ
+        GoldilocksExt3.Ext3[] memory batch2PolyEvalsGZ = _parseExt3Array(
+            constraintJson, ".batch2EvalsAtGZeta", polyCounts[2]
+        );
+        SumcheckBridgeVerifier.verifySubDecomposition(batchEvalsGZ[2], polyDegree, gZetaExt3, batch2PolyEvalsGZ);
+        console.log("[e2e] Step 8: Intra-batch sub-decomposition (batch2 at g*zeta) PASSED");
+
+        // Step 9-10: Build verified openings and check constraints
+        _buildOpeningsAndVerifyConstraints(
+            constraintJson, polyCounts, batch2PolyEvalsGZ,
+            chal, publicInputs
+        );
+    }
+
+    function _buildOpeningsAndVerifyConstraints(
+        string memory constraintJson,
+        uint256[] memory polyCounts,
+        GoldilocksExt3.Ext3[] memory batch2PolyEvalsGZ,
+        Challenges memory chal,
+        uint256[] memory publicInputs
+    ) internal {
+        uint256 numChallenges = chal.plonkBetas.length;
+        // Load per-polynomial evals for each batch at ζ
+        GoldilocksExt3.Ext3[] memory b0evals = _parseExt3Array(constraintJson, ".intraBatchEvalsAtZeta[0]", polyCounts[0]);
+        GoldilocksExt3.Ext3[] memory b1evals = _parseExt3Array(constraintJson, ".intraBatchEvalsAtZeta[1]", polyCounts[1]);
+        GoldilocksExt3.Ext3[] memory b2evals = _parseExt3Array(constraintJson, ".intraBatchEvalsAtZeta[2]", polyCounts[2]);
+        GoldilocksExt3.Ext3[] memory b3evals = _parseExt3Array(constraintJson, ".intraBatchEvalsAtZeta[3]", polyCounts[3]);
+
+        uint256 numRoutedWires = _u(constraintJson, ".circuitParams.numRoutedWires");
+        uint256 numPartialProducts = _u(constraintJson, ".circuitParams.numPartialProducts");
+
+        // Build Openings from verified sub-decomposed Ext3 evaluations (already Ext3)
+        Openings memory openings;
+
+        // batch 0: constants then plonkSigmas
+        {
+            uint256 numSigmaPolys = numRoutedWires;
+            uint256 numConstantEntries = polyCounts[0] - numSigmaPolys;
+            openings.constants = new GoldilocksExt3.Ext3[](numConstantEntries);
+            for (uint256 i = 0; i < numConstantEntries; i++) {
+                openings.constants[i] = b0evals[i];
+            }
+            openings.plonkSigmas = new GoldilocksExt3.Ext3[](numSigmaPolys);
+            for (uint256 i = 0; i < numSigmaPolys; i++) {
+                openings.plonkSigmas[i] = b0evals[numConstantEntries + i];
+            }
+        }
+
+        // batch 1: wires
+        openings.wires = new GoldilocksExt3.Ext3[](polyCounts[1]);
+        for (uint256 i = 0; i < polyCounts[1]; i++) {
+            openings.wires[i] = b1evals[i];
+        }
+
+        // batch 2: [Z, partialProducts...] per challenge + Z(gζ)
+        {
+            uint256 stride = 1 + numPartialProducts;
+            openings.plonkZs = new GoldilocksExt3.Ext3[](numChallenges);
+            openings.partialProducts = new GoldilocksExt3.Ext3[](numChallenges * numPartialProducts);
+            openings.plonkZsNext = new GoldilocksExt3.Ext3[](numChallenges);
+            for (uint256 ch = 0; ch < numChallenges; ch++) {
+                openings.plonkZs[ch] = b2evals[ch * stride];
+                for (uint256 pp = 0; pp < numPartialProducts; pp++) {
+                    openings.partialProducts[ch * numPartialProducts + pp] = b2evals[ch * stride + 1 + pp];
+                }
+                openings.plonkZsNext[ch] = batch2PolyEvalsGZ[ch * stride];
+            }
+        }
+
+        // batch 3: quotient chunks
+        openings.quotientPolys = new GoldilocksExt3.Ext3[](polyCounts[3]);
+        for (uint256 i = 0; i < polyCounts[3]; i++) {
+            openings.quotientPolys[i] = b3evals[i];
+        }
+        console.log("[e2e] Step 9: Verified Openings built from sub-decomposition");
+
+        // Step 10: Plonky2 constraint check with FULLY VERIFIED data
+        CircuitParams memory params;
+        params.degreeBits = _u(constraintJson, ".circuitParams.degreeBits");
+        params.numChallenges = numChallenges;
+        params.numRoutedWires = numRoutedWires;
+        params.quotientDegreeFactor = _u(constraintJson, ".circuitParams.quotientDegreeFactor");
+        params.numPartialProducts = numPartialProducts;
+        params.numGateConstraints = _u(constraintJson, ".circuitParams.numGateConstraints");
+        params.numSelectors = _u(constraintJson, ".circuitParams.numSelectors");
+        params.numLookupSelectors = _u(constraintJson, ".circuitParams.numLookupSelectors");
+
+        PermutationData memory permData;
+        permData.kIs = abi.decode(vm.parseJson(constraintJson, ".permutation.kIs"), (uint256[]));
+
+        GateInfo[] memory gates = _parseGates(constraintJson,
+            abi.decode(vm.parseJson(constraintJson, ".gates..gateType"), (uint256[])).length
+        );
+
+        bool valid = verifyConstraints(openings, params, chal, permData, gates, publicInputs);
+        assertTrue(valid, "Plonky2 constraint verification with verified openings must pass");
+        console.log("[e2e] Step 10: Plonky2 constraints with VERIFIED openings PASSED");
     }
 
     // =====================================================================
@@ -408,7 +596,7 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         p.initialCosetSize = _u(json, ".whir_params.initial_coset_size");
         p.initialNumCosets = _u(json, ".whir_params.initial_num_cosets");
 
-        // Load evaluation point (sumcheck-derived r, or empty for canonical)
+        // Load evaluation point r₁ (sumcheck-derived, or empty for canonical)
         {
             uint256 nv = p.numVariables;
             p.evaluationPoint = new GoldilocksExt3.Ext3[](nv);
@@ -418,6 +606,24 @@ contract GenericE2ETest is Test, Plonky2Verifier {
                 uint64 c1 = uint64(_u(json, string.concat(epPrefix, "c1")));
                 uint64 c2 = uint64(_u(json, string.concat(epPrefix, "c2")));
                 p.evaluationPoint[i] = GoldilocksExt3.Ext3(c0, c1, c2);
+            }
+        }
+
+        // Load second evaluation point r₂ (for dual-point / gζ bridge)
+        // This is in the sumcheck_g_zeta section of the WHIR verifier data
+        {
+            // Check if sumcheck_g_zeta.eval_point exists
+            bytes memory rawEp2 = vm.parseJson(json, ".sumcheck_g_zeta.eval_point");
+            if (rawEp2.length > 0) {
+                uint256 nv = p.numVariables;
+                p.evaluationPoint2 = new GoldilocksExt3.Ext3[](nv);
+                for (uint256 i = 0; i < nv; i++) {
+                    string memory epPrefix = string.concat(".sumcheck_g_zeta.eval_point[", vm.toString(i), "].");
+                    uint64 c0 = uint64(_u(json, string.concat(epPrefix, "c0")));
+                    uint64 c1 = uint64(_u(json, string.concat(epPrefix, "c1")));
+                    uint64 c2 = uint64(_u(json, string.concat(epPrefix, "c2")));
+                    p.evaluationPoint2[i] = GoldilocksExt3.Ext3(c0, c1, c2);
+                }
             }
         }
 
@@ -460,11 +666,13 @@ contract GenericE2ETest is Test, Plonky2Verifier {
         return abi.decode(vm.parseJson(json, path), (uint256));
     }
 
+    /// @dev Convert flat u64 array [c0, c1, c0, c1, ...] (Ext2 format) to Ext3 with c2=0.
+    /// TODO: When the Rust exporter outputs Ext3 triplets [c0, c1, c2, ...], update to read 3 per element.
     function _flatToExt3(uint256[] memory flat) internal pure returns (GoldilocksExt3.Ext3[] memory) {
-        uint256 len = flat.length / 3;
+        uint256 len = flat.length / 2;
         GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](len);
         for (uint256 i = 0; i < len; i++) {
-            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 3]), uint64(flat[i * 3 + 1]), uint64(flat[i * 3 + 2]));
+            result[i] = GoldilocksExt3.Ext3(uint64(flat[i * 2]), uint64(flat[i * 2 + 1]), 0);
         }
         return result;
     }
@@ -491,5 +699,85 @@ contract GenericE2ETest is Test, Plonky2Verifier {
             );
         }
         return gates;
+    }
+
+    /// @dev Parse an array of Ext3 values from JSON at a given path prefix.
+    function _parseExt3Array(string memory json, string memory arrayPath, uint256 count)
+        internal pure returns (GoldilocksExt3.Ext3[] memory result)
+    {
+        result = new GoldilocksExt3.Ext3[](count);
+        for (uint256 i = 0; i < count; i++) {
+            string memory prefix = string.concat(arrayPath, "[", vm.toString(i), "].");
+            result[i] = GoldilocksExt3.Ext3(
+                uint64(_u(json, string.concat(prefix, "c0"))),
+                uint64(_u(json, string.concat(prefix, "c1"))),
+                uint64(_u(json, string.concat(prefix, "c2")))
+            );
+        }
+    }
+
+    /// @dev Verify sumcheck bridge #2 for g*zeta.
+    function _verifySumcheckBridgeGZeta(string memory json) internal pure {
+        uint256 numRounds = _u(json, ".sumcheck_g_zeta.num_rounds");
+        string memory sessionName = abi.decode(vm.parseJson(json, ".sumcheck.session_name"), (string));
+
+        GoldilocksExt3.Ext3 memory gZeta = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck_g_zeta.g_zeta.c0")),
+            uint64(_u(json, ".sumcheck_g_zeta.g_zeta.c1")),
+            uint64(_u(json, ".sumcheck_g_zeta.g_zeta.c2"))
+        );
+
+        GoldilocksExt3.Ext3 memory claimedSum = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".sumcheck_g_zeta.claimed_sum.c0")),
+            uint64(_u(json, ".sumcheck_g_zeta.claimed_sum.c1")),
+            uint64(_u(json, ".sumcheck_g_zeta.claimed_sum.c2"))
+        );
+
+        // Parse round polynomials for g*zeta sumcheck
+        GoldilocksExt3.Ext3[][] memory roundPolys = new GoldilocksExt3.Ext3[][](numRounds);
+        for (uint256 i = 0; i < numRounds; i++) {
+            roundPolys[i] = new GoldilocksExt3.Ext3[](3);
+            for (uint256 j = 0; j < 3; j++) {
+                string memory prefix = string.concat(
+                    ".sumcheck_g_zeta.round_polys[", vm.toString(i), "][", vm.toString(j), "]."
+                );
+                roundPolys[i][j] = GoldilocksExt3.Ext3(
+                    uint64(_u(json, string.concat(prefix, "c0"))),
+                    uint64(_u(json, string.concat(prefix, "c1"))),
+                    uint64(_u(json, string.concat(prefix, "c2")))
+                );
+            }
+        }
+
+        // Verify sumcheck #2: using "sumcheck-challenges-gzeta" domain separation tag
+        (
+            GoldilocksExt3.Ext3[] memory evalPoint2,
+            GoldilocksExt3.Ext3 memory finalClaim2
+        ) = SumcheckBridgeVerifier.verifyWithTag(
+            numRounds, roundPolys, gZeta, claimedSum, sessionName, "sumcheck-challenges-gzeta"
+        );
+
+        // Verify evalPoint2 matches fixture
+        for (uint256 i = 0; i < numRounds; i++) {
+            string memory epPrefix = string.concat(".sumcheck_g_zeta.eval_point[", vm.toString(i), "].");
+            uint64 ec0 = uint64(_u(json, string.concat(epPrefix, "c0")));
+            uint64 ec1 = uint64(_u(json, string.concat(epPrefix, "c1")));
+            uint64 ec2 = uint64(_u(json, string.concat(epPrefix, "c2")));
+            require(
+                evalPoint2[i].c0 == ec0 && evalPoint2[i].c1 == ec1 && evalPoint2[i].c2 == ec2,
+                string.concat("evalPoint2 mismatch at round ", vm.toString(i))
+            );
+        }
+
+        // Compute h_{gζ}(r₂) and verify binding
+        GoldilocksExt3.Ext3 memory hGZetaAtR2 = SumcheckBridgeVerifier.computeHZeta(gZeta, evalPoint2);
+
+        GoldilocksExt3.Ext3 memory whirEvalAtR2 = GoldilocksExt3.Ext3(
+            uint64(_u(json, ".evaluations[1].c0")),
+            uint64(_u(json, ".evaluations[1].c1")),
+            uint64(_u(json, ".evaluations[1].c2"))
+        );
+
+        SumcheckBridgeVerifier.verifyBinding(whirEvalAtR2, hGZetaAtR2, finalClaim2);
     }
 }

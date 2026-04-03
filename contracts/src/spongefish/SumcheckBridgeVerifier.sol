@@ -42,16 +42,34 @@ library SumcheckBridgeVerifier {
             GoldilocksExt3.Ext3 memory finalClaim
         )
     {
+        return verifyWithTag(numRounds, roundPolys, zeta, claimedSum, sessionName, "sumcheck-challenges");
+    }
+
+    /// @notice Verify sumcheck bridge with a custom Fiat-Shamir domain tag.
+    ///         Used for gζ bridge which uses "sumcheck-challenges-gzeta" tag.
+    function verifyWithTag(
+        uint256 numRounds,
+        GoldilocksExt3.Ext3[][] memory roundPolys,
+        GoldilocksExt3.Ext3 memory zeta,
+        GoldilocksExt3.Ext3 memory claimedSum,
+        string memory sessionName,
+        string memory fsTag
+    )
+        internal
+        pure
+        returns (
+            GoldilocksExt3.Ext3[] memory evalPoint,
+            GoldilocksExt3.Ext3 memory finalClaim
+        )
+    {
         require(roundPolys.length == numRounds, "round count mismatch");
 
         evalPoint = new GoldilocksExt3.Ext3[](numRounds);
         GoldilocksExt3.Ext3 memory currentClaim = claimedSum;
 
         // Build Fiat-Shamir accumulator: matches Rust's Keccak256::new() + update() pattern.
-        // Rust uses a running Keccak state: each .clone().finalize() hashes ALL accumulated data.
-        // We simulate this by accumulating bytes and hashing the full buffer each time.
         bytes memory fsAccum = abi.encodePacked(
-            "sumcheck-challenges",
+            bytes(fsTag),
             bytes(sessionName),
             _ext3ToLeBytes(zeta)
         );
@@ -292,6 +310,103 @@ library SumcheckBridgeVerifier {
         }
     }
 
+
+    /// @notice Derive Plonky2 challenges using the WHIR Merkle root (v2).
+    ///         Matches Rust: keccak256("plonky2-challenges-v2" || session_name || merkle_root || PI_LE)
+    ///         The Merkle root is the first 32 bytes of the WHIR transcript.
+    ///         This binds challenges to the polynomial commitment without circularity.
+    /// @param transcript The WHIR transcript bytes (first 32 bytes = Merkle root)
+    /// @param sessionName Session name for domain separation
+    /// @param publicInputs Public input field elements (Goldilocks u64)
+    /// @param numChallenges Number of challenge values per category
+    function deriveKeccakChallengesV2(
+        bytes memory transcript,
+        bytes memory sessionName,
+        uint256[] memory publicInputs,
+        uint256 numChallenges
+    ) internal pure returns (
+        uint256[] memory betas,
+        uint256[] memory gammas,
+        uint256[] memory alphas,
+        uint256 zetaC0,
+        uint256 zetaC1,
+        uint256 zetaC2
+    ) {
+        // Extract Merkle root = first 32 bytes of transcript
+        require(transcript.length >= 32, "transcript too short for Merkle root");
+        bytes memory merkleRoot = new bytes(32);
+        for (uint256 i = 0; i < 32; i++) {
+            merkleRoot[i] = transcript[i];
+        }
+
+        // Initial hash: keccak256("plonky2-challenges-v2" || session_name || merkle_root || PI_LE)
+        bytes memory initData = abi.encodePacked("plonky2-challenges-v2", sessionName, merkleRoot);
+        for (uint256 i = 0; i < publicInputs.length; i++) {
+            initData = abi.encodePacked(initData, _u64ToLeBytes(uint64(publicInputs[i])));
+        }
+        bytes32 state = keccak256(initData);
+
+        // Squeeze challenges in sequence: betas, gammas, alphas, zeta (3 components for Ext3)
+        betas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            betas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        gammas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            gammas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        alphas = new uint256[](numChallenges);
+        for (uint256 i = 0; i < numChallenges; i++) {
+            state = keccak256(abi.encodePacked(state));
+            alphas[i] = _leU64(uint256(state) >> 192) % GL_P;
+        }
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC0 = _leU64(uint256(state) >> 192) % GL_P;
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC1 = _leU64(uint256(state) >> 192) % GL_P;
+
+        state = keccak256(abi.encodePacked(state));
+        zetaC2 = _leU64(uint256(state) >> 192) % GL_P;
+    }
+
+    /// @notice Verify intra-batch polynomial sub-decomposition.
+    ///         Within each batch, individual polynomials of uniform degree N are
+    ///         concatenated. So: batchEval = Σ_j polyEvals[j] · zeta^{j·N}
+    /// @param batchEval The verified batch-level evaluation at zeta
+    /// @param polyDegree The degree N of each polynomial in the batch (= 2^degree_bits)
+    /// @param zeta The evaluation point
+    /// @param polyEvals Per-polynomial evaluations within the batch
+    function verifySubDecomposition(
+        GoldilocksExt3.Ext3 memory batchEval,
+        uint256 polyDegree,
+        GoldilocksExt3.Ext3 memory zeta,
+        GoldilocksExt3.Ext3[] memory polyEvals
+    ) internal pure {
+        require(polyEvals.length > 0, "subdecomp: empty polyEvals");
+
+        // zetaN = zeta^N (the stride between polynomials)
+        GoldilocksExt3.Ext3 memory zetaN = _ext3Pow(zeta, polyDegree);
+
+        // Compute recomposition: polyEvals[0] + zetaN * polyEvals[1] + zetaN^2 * polyEvals[2] + ...
+        // Using Horner's method: ((polyEvals[k-1] * zetaN + polyEvals[k-2]) * zetaN + ...)
+        GoldilocksExt3.Ext3 memory recomputed = polyEvals[polyEvals.length - 1];
+        for (uint256 i = polyEvals.length - 1; i > 0; i--) {
+            recomputed = recomputed.mul(zetaN).add(polyEvals[i - 1]);
+        }
+
+        require(
+            recomputed.c0 == batchEval.c0 &&
+            recomputed.c1 == batchEval.c1 &&
+            recomputed.c2 == batchEval.c2,
+            "subdecomp: batch eval != sum of poly evals"
+        );
+    }
 
     /// @dev Evaluate degree-2 polynomial at point r via Lagrange interpolation on {0,1,2}.
     ///      g(r) = g(0)·L_0(r) + g(1)·L_1(r) + g(2)·L_2(r)

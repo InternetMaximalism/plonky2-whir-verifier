@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import "./GoldilocksField.sol";
 import "./PoseidonGateEval.sol";
 import "./PoseidonConstants.sol";
-import {GoldilocksExt3} from "./spongefish/GoldilocksExt3.sol";
+import "./spongefish/GoldilocksExt3.sol";
 
 /// @title Plonky2Verifier — On-chain Plonky2 constraint satisfaction check
 /// @dev Verifies that polynomial openings at challenge point ζ satisfy
@@ -91,6 +91,24 @@ contract Plonky2Verifier {
     }
 
     // -----------------------------------------------------------------------
+    // Circuit extension (D=2) helpers using W=7
+    // -----------------------------------------------------------------------
+    // The Plonky2 circuit uses quadratic extension (D=2) over the evaluation field.
+    // A "circuit Ext2 element" is a pair (a0, a1) of Ext3 values representing a0 + a1*α
+    // where α^2 = 7 (Goldilocks quadratic non-residue W=7).
+
+    /// @dev Circuit Ext2 multiply: (a0 + a1*α)(b0 + b1*α) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*α
+    function _circuitExt2Mul(
+        GoldilocksExt3.Ext3 memory a0, GoldilocksExt3.Ext3 memory a1,
+        GoldilocksExt3.Ext3 memory b0, GoldilocksExt3.Ext3 memory b1
+    ) internal pure returns (GoldilocksExt3.Ext3 memory r0, GoldilocksExt3.Ext3 memory r1) {
+        // r0 = a0*b0 + 7*a1*b1
+        r0 = a0.mul(b0).add(a1.mul(b1).mulScalar(7));
+        // r1 = a0*b1 + a1*b0
+        r1 = a0.mul(b1).add(a1.mul(b0));
+    }
+
+    // -----------------------------------------------------------------------
     // Main verification entry point
     // -----------------------------------------------------------------------
 
@@ -126,7 +144,7 @@ contract Plonky2Verifier {
             }
             GoldilocksExt3.Ext3 memory quotientAtZeta = GoldilocksExt3.reduceWithPowers(chunks, zetaPowN);
             GoldilocksExt3.Ext3 memory rhs = zHZeta.mul(quotientAtZeta);
-            if (!GoldilocksExt3.isEqual(vanishing[i], rhs)) {
+            if (!GoldilocksExt3.eq(vanishing[i], rhs)) {
                 return false;
             }
         }
@@ -241,12 +259,12 @@ contract Plonky2Verifier {
 
         for (uint256 i = groupStart; i < groupEnd; i++) {
             if (i != row) {
-                filter = filter.mul(GoldilocksExt3.fromBaseU256(i).sub(s));
+                filter = filter.mul(GoldilocksExt3.fromBase(uint64(i)).sub(s));
             }
         }
 
         if (multipleSelectors) {
-            filter = filter.mul(GoldilocksExt3.fromBaseU256(UNUSED_SELECTOR).sub(s));
+            filter = filter.mul(GoldilocksExt3.fromBase(uint64(UNUSED_SELECTOR)).sub(s));
         }
 
         return filter;
@@ -303,8 +321,8 @@ contract Plonky2Verifier {
     ) internal pure returns (GoldilocksExt3.Ext3[] memory) {
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](4);
         for (uint256 i = 0; i < 4; i++) {
-            GoldilocksExt3.Ext3 memory piVal = GoldilocksExt3.fromBaseU256(
-                i < publicInputs.length ? publicInputs[i] : 0
+            GoldilocksExt3.Ext3 memory piVal = GoldilocksExt3.fromBase(
+                uint64(i < publicInputs.length ? publicInputs[i] : 0)
             );
             c[i] = openings.wires[i].sub(piVal);
         }
@@ -345,7 +363,7 @@ contract Plonky2Verifier {
         // Constraint 0: reduce_with_powers(limbs, base) - sum
         GoldilocksExt3.Ext3 memory computedSum = GoldilocksExt3.zero();
         GoldilocksExt3.Ext3 memory basePow = GoldilocksExt3.one();
-        GoldilocksExt3.Ext3 memory baseExt = GoldilocksExt3.fromBaseU256(base);
+        GoldilocksExt3.Ext3 memory baseExt = GoldilocksExt3.fromBase(uint64(base));
         for (uint256 i = 0; i < numLimbs; i++) {
             computedSum = computedSum.add(openings.wires[1 + i].mul(basePow));
             if (i + 1 < numLimbs) basePow = basePow.mul(baseExt);
@@ -356,7 +374,7 @@ contract Plonky2Verifier {
         for (uint256 i = 0; i < numLimbs; i++) {
             GoldilocksExt3.Ext3 memory prod = GoldilocksExt3.one();
             for (uint256 k = 0; k < base; k++) {
-                prod = prod.mul(openings.wires[1 + i].sub(GoldilocksExt3.fromBaseU256(k)));
+                prod = prod.mul(openings.wires[1 + i].sub(GoldilocksExt3.fromBase(uint64(k))));
             }
             c[1 + i] = prod;
         }
@@ -430,6 +448,9 @@ contract Plonky2Verifier {
     ///      Same as ReducingExtensionGate but coefficients are single base field elements,
     ///      not extension field elements.
     ///      gateConfig: [numCoeffs]
+    ///
+    ///      The circuit extension degree D=2 means accumulators and alpha are pairs of Ext3,
+    ///      representing elements of (Ext3)^2 with W=7 arithmetic.
     function _evalReducingGate(
         Openings memory openings,
         uint256[] memory gateConfig
@@ -439,40 +460,46 @@ contract Plonky2Verifier {
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](numCoeffs * D);
 
         // Wire layout (D=2):
-        //   wires[0..1]: output (extension element)
-        //   wires[2..3]: alpha (extension element)
+        //   wires[0..1]: output (circuit extension element = pair of Ext3)
+        //   wires[2..3]: alpha (circuit extension element)
         //   wires[4..5]: old_acc (initial accumulator)
         //   wires[6..6+numCoeffs-1]: coefficients (numCoeffs BASE FIELD scalars)
-        //   Non-routed: accumulators (numCoeffs extension elements, last reuses output)
-        GoldilocksExt3.Ext3 memory alpha = GoldilocksExt3.Ext3(
-            openings.wires[2].c0, openings.wires[3].c0, 0
-        );
+        //   Non-routed: accumulators (numCoeffs circuit extension elements, last reuses output)
+        GoldilocksExt3.Ext3 memory alpha0 = openings.wires[2];
+        GoldilocksExt3.Ext3 memory alpha1 = openings.wires[3];
         uint256 numRouted = 3 * D + numCoeffs; // coefficients are single scalars
 
-        GoldilocksExt3.Ext3 memory prevAcc = GoldilocksExt3.Ext3(
-            openings.wires[4].c0, openings.wires[5].c0, 0
-        );
+        GoldilocksExt3.Ext3 memory prevAcc0 = openings.wires[4];
+        GoldilocksExt3.Ext3 memory prevAcc1 = openings.wires[5];
 
         for (uint256 i = 0; i < numCoeffs; i++) {
-            // Coefficient is a single base field scalar (promoted to Ext3 via fromBase)
-            GoldilocksExt3.Ext3 memory coeff = GoldilocksExt3.fromBase(openings.wires[6 + i].c0);
-            GoldilocksExt3.Ext3 memory computed = prevAcc.mul(alpha).add(coeff);
+            // Coefficient is a single base field scalar (promoted to circuit ext via (coeff, 0))
+            GoldilocksExt3.Ext3 memory coeff = openings.wires[6 + i];
 
-            GoldilocksExt3.Ext3 memory actualAcc;
+            // computed = prevAcc * alpha + (coeff, 0) using circuit Ext2 mul with W=7
+            (GoldilocksExt3.Ext3 memory prod0, GoldilocksExt3.Ext3 memory prod1) =
+                _circuitExt2Mul(prevAcc0, prevAcc1, alpha0, alpha1);
+            GoldilocksExt3.Ext3 memory computed0 = prod0.add(coeff);
+            GoldilocksExt3.Ext3 memory computed1 = prod1;
+
+            GoldilocksExt3.Ext3 memory actualAcc0;
+            GoldilocksExt3.Ext3 memory actualAcc1;
             if (i == numCoeffs - 1) {
-                actualAcc = GoldilocksExt3.Ext3(openings.wires[0].c0, openings.wires[1].c0, 0);
+                actualAcc0 = openings.wires[0];
+                actualAcc1 = openings.wires[1];
             } else {
                 uint256 accBase = numRouted + i * D;
-                actualAcc = GoldilocksExt3.Ext3(
-                    openings.wires[accBase].c0, openings.wires[accBase + 1].c0, 0
-                );
+                actualAcc0 = openings.wires[accBase];
+                actualAcc1 = openings.wires[accBase + 1];
             }
 
-            GoldilocksExt3.Ext3 memory diff = actualAcc.sub(computed);
-            c[i * D] = GoldilocksExt3.fromBase(diff.c0);
-            c[i * D + 1] = GoldilocksExt3.fromBase(diff.c1);
+            GoldilocksExt3.Ext3 memory diff0 = actualAcc0.sub(computed0);
+            GoldilocksExt3.Ext3 memory diff1 = actualAcc1.sub(computed1);
+            c[i * D] = diff0;
+            c[i * D + 1] = diff1;
 
-            prevAcc = actualAcc;
+            prevAcc0 = actualAcc0;
+            prevAcc1 = actualAcc1;
         }
         return c;
     }
@@ -480,64 +507,69 @@ contract Plonky2Verifier {
     /// @dev ReducingExtensionGate: Horner-style polynomial evaluation
     ///      acc[0] = old_acc * alpha + coeff[0]
     ///      acc[i] = acc[i-1] * alpha + coeff[i]
-    ///      constraint[i*D..i*D+D-1]: acc[i] - computed (D=2 extension components)
+    ///      constraint[i*D..i*D+D-1]: acc[i] - computed (D=2 circuit extension components)
     ///      gateConfig: [numCoeffs]
     function _evalReducingExtensionGate(
         Openings memory openings,
         uint256[] memory gateConfig
     ) internal pure returns (GoldilocksExt3.Ext3[] memory) {
         uint256 numCoeffs = gateConfig[0];
-        uint256 D = 2; // Extension degree (wire packing)
+        uint256 D = 2; // Circuit extension degree
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](numCoeffs * D);
 
         // Wire layout (D=2):
-        //   wires[0..1]: output (extension element)
-        //   wires[2..3]: alpha (extension element)
+        //   wires[0..1]: output (circuit extension element)
+        //   wires[2..3]: alpha (circuit extension element)
         //   wires[4..5]: old_acc (initial accumulator)
-        //   wires[6..6+numCoeffs*2-1]: coefficients (numCoeffs extension elements)
+        //   wires[6..6+numCoeffs*2-1]: coefficients (numCoeffs circuit extension elements)
         //   Non-routed: intermediate accumulators (except last = output)
-        GoldilocksExt3.Ext3 memory alpha = GoldilocksExt3.Ext3(
-            openings.wires[2].c0, openings.wires[3].c0, 0
-        );
+        GoldilocksExt3.Ext3 memory alpha0 = openings.wires[2];
+        GoldilocksExt3.Ext3 memory alpha1 = openings.wires[3];
 
         // Start wire index for intermediates (non-routed)
         uint256 numRouted = 3 * D + numCoeffs * D;
 
-        GoldilocksExt3.Ext3 memory prevAcc = GoldilocksExt3.Ext3(
-            openings.wires[4].c0, openings.wires[5].c0, 0
-        );
+        GoldilocksExt3.Ext3 memory prevAcc0 = openings.wires[4];
+        GoldilocksExt3.Ext3 memory prevAcc1 = openings.wires[5];
 
         for (uint256 i = 0; i < numCoeffs; i++) {
             uint256 coeffBase = 6 + i * D;
-            GoldilocksExt3.Ext3 memory coeff = GoldilocksExt3.Ext3(
-                openings.wires[coeffBase].c0, openings.wires[coeffBase + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory computed = prevAcc.mul(alpha).add(coeff);
+            GoldilocksExt3.Ext3 memory coeff0 = openings.wires[coeffBase];
+            GoldilocksExt3.Ext3 memory coeff1 = openings.wires[coeffBase + 1];
+
+            // computed = prevAcc * alpha + coeff using circuit Ext2 mul with W=7
+            (GoldilocksExt3.Ext3 memory prod0, GoldilocksExt3.Ext3 memory prod1) =
+                _circuitExt2Mul(prevAcc0, prevAcc1, alpha0, alpha1);
+            GoldilocksExt3.Ext3 memory computed0 = prod0.add(coeff0);
+            GoldilocksExt3.Ext3 memory computed1 = prod1.add(coeff1);
 
             // Get the actual accumulator value
-            GoldilocksExt3.Ext3 memory actualAcc;
+            GoldilocksExt3.Ext3 memory actualAcc0;
+            GoldilocksExt3.Ext3 memory actualAcc1;
             if (i == numCoeffs - 1) {
                 // Last accumulator is the output wire
-                actualAcc = GoldilocksExt3.Ext3(openings.wires[0].c0, openings.wires[1].c0, 0);
+                actualAcc0 = openings.wires[0];
+                actualAcc1 = openings.wires[1];
             } else {
                 // Intermediate accumulators in non-routed wires
                 uint256 accBase = numRouted + i * D;
-                actualAcc = GoldilocksExt3.Ext3(
-                    openings.wires[accBase].c0, openings.wires[accBase + 1].c0, 0
-                );
+                actualAcc0 = openings.wires[accBase];
+                actualAcc1 = openings.wires[accBase + 1];
             }
 
-            // Constraint: actualAcc - computed (split into D=2 base field components)
-            GoldilocksExt3.Ext3 memory diff = actualAcc.sub(computed);
-            c[i * D] = GoldilocksExt3.fromBase(diff.c0);
-            c[i * D + 1] = GoldilocksExt3.fromBase(diff.c1);
+            // Constraint: actualAcc - computed (D=2 circuit extension components, each an Ext3)
+            GoldilocksExt3.Ext3 memory diff0 = actualAcc0.sub(computed0);
+            GoldilocksExt3.Ext3 memory diff1 = actualAcc1.sub(computed1);
+            c[i * D] = diff0;
+            c[i * D + 1] = diff1;
 
-            prevAcc = actualAcc;
+            prevAcc0 = actualAcc0;
+            prevAcc1 = actualAcc1;
         }
         return c;
     }
 
-    /// @dev ArithmeticExtensionGate: c0*x*y + c1*z on extension field elements
+    /// @dev ArithmeticExtensionGate: c0*x*y + c1*z on circuit extension field elements (D=2)
     ///      gateConfig: [numOps]
     function _evalArithmeticExtensionGate(
         Openings memory openings,
@@ -550,32 +582,37 @@ contract Plonky2Verifier {
 
         for (uint256 i = 0; i < numOps; i++) {
             uint256 wBase = i * 4 * D;
-            // Read extension elements (each is D=2 consecutive wires)
-            GoldilocksExt3.Ext3 memory m0 = GoldilocksExt3.Ext3(
-                openings.wires[wBase].c0, openings.wires[wBase + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory m1 = GoldilocksExt3.Ext3(
-                openings.wires[wBase + D].c0, openings.wires[wBase + D + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory addend = GoldilocksExt3.Ext3(
-                openings.wires[wBase + 2 * D].c0, openings.wires[wBase + 2 * D + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory output = GoldilocksExt3.Ext3(
-                openings.wires[wBase + 3 * D].c0, openings.wires[wBase + 3 * D + 1].c0, 0
-            );
-            // Constants are base field scalars
-            GoldilocksExt3.Ext3 memory c0 = openings.constants[constOffset + i * 2];
-            GoldilocksExt3.Ext3 memory c1 = openings.constants[constOffset + i * 2 + 1];
+            // Read circuit extension elements (each is D=2 consecutive Ext3 wire openings)
+            GoldilocksExt3.Ext3 memory m0_0 = openings.wires[wBase];
+            GoldilocksExt3.Ext3 memory m0_1 = openings.wires[wBase + 1];
+            GoldilocksExt3.Ext3 memory m1_0 = openings.wires[wBase + D];
+            GoldilocksExt3.Ext3 memory m1_1 = openings.wires[wBase + D + 1];
+            GoldilocksExt3.Ext3 memory add0 = openings.wires[wBase + 2 * D];
+            GoldilocksExt3.Ext3 memory add1 = openings.wires[wBase + 2 * D + 1];
+            GoldilocksExt3.Ext3 memory out0 = openings.wires[wBase + 3 * D];
+            GoldilocksExt3.Ext3 memory out1 = openings.wires[wBase + 3 * D + 1];
 
-            GoldilocksExt3.Ext3 memory expected = m0.mul(m1).mul(c0).add(addend.mul(c1));
-            GoldilocksExt3.Ext3 memory diff = output.sub(expected);
-            c[i * D] = GoldilocksExt3.fromBase(diff.c0);
-            c[i * D + 1] = GoldilocksExt3.fromBase(diff.c1);
+            // Constants are base field scalars (Ext3 openings, use as scalar multiplier)
+            GoldilocksExt3.Ext3 memory cc0 = openings.constants[constOffset + i * 2];
+            GoldilocksExt3.Ext3 memory cc1 = openings.constants[constOffset + i * 2 + 1];
+
+            // product = m0 * m1 (circuit Ext2 mul with W=7)
+            (GoldilocksExt3.Ext3 memory p0, GoldilocksExt3.Ext3 memory p1) =
+                _circuitExt2Mul(m0_0, m0_1, m1_0, m1_1);
+
+            // expected = product * c0 + addend * c1
+            // c0 and c1 are Ext3 elements (constants evaluated at zeta)
+            // product * c0 means scaling each component of the circuit Ext2 pair by the Ext3 constant
+            GoldilocksExt3.Ext3 memory exp0 = p0.mul(cc0).add(add0.mul(cc1));
+            GoldilocksExt3.Ext3 memory exp1 = p1.mul(cc0).add(add1.mul(cc1));
+
+            c[i * D] = out0.sub(exp0);
+            c[i * D + 1] = out1.sub(exp1);
         }
         return c;
     }
 
-    /// @dev MulExtensionGate: c0*x*y on extension field elements
+    /// @dev MulExtensionGate: c0*x*y on circuit extension field elements (D=2)
     ///      gateConfig: [numOps]
     function _evalMulExtensionGate(
         Openings memory openings,
@@ -588,20 +625,25 @@ contract Plonky2Verifier {
 
         for (uint256 i = 0; i < numOps; i++) {
             uint256 wBase = i * 3 * D;
-            GoldilocksExt3.Ext3 memory m0 = GoldilocksExt3.Ext3(
-                openings.wires[wBase].c0, openings.wires[wBase + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory m1 = GoldilocksExt3.Ext3(
-                openings.wires[wBase + D].c0, openings.wires[wBase + D + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory output = GoldilocksExt3.Ext3(
-                openings.wires[wBase + 2 * D].c0, openings.wires[wBase + 2 * D + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory c0 = openings.constants[constOffset + i];
-            GoldilocksExt3.Ext3 memory expected = m0.mul(m1).mul(c0);
-            GoldilocksExt3.Ext3 memory diff = output.sub(expected);
-            c[i * D] = GoldilocksExt3.fromBase(diff.c0);
-            c[i * D + 1] = GoldilocksExt3.fromBase(diff.c1);
+            GoldilocksExt3.Ext3 memory m0_0 = openings.wires[wBase];
+            GoldilocksExt3.Ext3 memory m0_1 = openings.wires[wBase + 1];
+            GoldilocksExt3.Ext3 memory m1_0 = openings.wires[wBase + D];
+            GoldilocksExt3.Ext3 memory m1_1 = openings.wires[wBase + D + 1];
+            GoldilocksExt3.Ext3 memory out0 = openings.wires[wBase + 2 * D];
+            GoldilocksExt3.Ext3 memory out1 = openings.wires[wBase + 2 * D + 1];
+
+            GoldilocksExt3.Ext3 memory cc0 = openings.constants[constOffset + i];
+
+            // product = m0 * m1 (circuit Ext2 mul with W=7)
+            (GoldilocksExt3.Ext3 memory p0, GoldilocksExt3.Ext3 memory p1) =
+                _circuitExt2Mul(m0_0, m0_1, m1_0, m1_1);
+
+            // expected = product * c0 (scale each component by the Ext3 constant)
+            GoldilocksExt3.Ext3 memory exp0 = p0.mul(cc0);
+            GoldilocksExt3.Ext3 memory exp1 = p1.mul(cc0);
+
+            c[i * D] = out0.sub(exp0);
+            c[i * D + 1] = out1.sub(exp1);
         }
         return c;
     }
@@ -615,11 +657,11 @@ contract Plonky2Verifier {
         uint256 numPowerBits = gateConfig[0];
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](numPowerBits + 1);
 
-        GoldilocksExt3.Ext3 memory base = openings.wires[0];
+        GoldilocksExt3.Ext3 memory base_ = openings.wires[0];
         uint256 outputWire = 1 + numPowerBits;
         uint256 intermediateStart = 2 + numPowerBits;
 
-        GoldilocksExt3.Ext3 memory oneExt = GoldilocksExt3.one();
+        GoldilocksExt3.Ext3 memory oneVal = GoldilocksExt3.one();
 
         for (uint256 i = 0; i < numPowerBits; i++) {
             // Bit at position (numPowerBits - 1 - i) in BE order
@@ -628,7 +670,7 @@ contract Plonky2Verifier {
             // prev_intermediate = intermediate[i-1]^2 if i > 0, else 1
             GoldilocksExt3.Ext3 memory prevIntermediate;
             if (i == 0) {
-                prevIntermediate = oneExt;
+                prevIntermediate = oneVal;
             } else {
                 GoldilocksExt3.Ext3 memory prevVal = openings.wires[intermediateStart + i - 1];
                 prevIntermediate = prevVal.mul(prevVal);
@@ -636,7 +678,7 @@ contract Plonky2Verifier {
 
             // computed = prevIntermediate * (curBit * base + (1 - curBit))
             //          = prevIntermediate * (curBit * (base - 1) + 1)
-            GoldilocksExt3.Ext3 memory selector = curBit.mul(base.sub(oneExt)).add(oneExt);
+            GoldilocksExt3.Ext3 memory selector = curBit.mul(base_.sub(oneVal)).add(oneVal);
             GoldilocksExt3.Ext3 memory computed = prevIntermediate.mul(selector);
             GoldilocksExt3.Ext3 memory actual = openings.wires[intermediateStart + i];
             c[i] = actual.sub(computed);
@@ -662,13 +704,13 @@ contract Plonky2Verifier {
 
         // Wire layout:
         //   wire[0]: shift (base field)
-        //   wires[1..1+numPoints*D-1]: values (numPoints extension elements)
-        //   wires[1+numPoints*D..+D-1]: evaluation_point (extension element)
-        //   wires[1+numPoints*D+D..+D-1]: evaluation_value (output extension element)
+        //   wires[1..1+numPoints*D-1]: values (numPoints circuit extension elements)
+        //   wires[1+numPoints*D..+D-1]: evaluation_point (circuit extension element)
+        //   wires[1+numPoints*D+D..+D-1]: evaluation_value (output circuit extension element)
         //   Non-routed:
-        //     intermediate_eval[i]: numIntermediates extension elements
-        //     intermediate_prod[i]: numIntermediates extension elements
-        //     shifted_evaluation_point: extension element
+        //     intermediate_eval[i]: numIntermediates circuit extension elements
+        //     intermediate_prod[i]: numIntermediates circuit extension elements
+        //     shifted_evaluation_point: circuit extension element
 
         uint256 evalPointStart = 1 + numPoints * D;
         uint256 evalValueStart = evalPointStart + D;
@@ -678,17 +720,17 @@ contract Plonky2Verifier {
         uint256 shiftedEvalStart = intProdStart + numIntermediates * D;
 
         GoldilocksExt3.Ext3 memory shift = openings.wires[0];
-        GoldilocksExt3.Ext3 memory evalPoint = GoldilocksExt3.Ext3(
-            openings.wires[evalPointStart].c0, openings.wires[evalPointStart + 1].c0, 0
-        );
-        GoldilocksExt3.Ext3 memory shiftedEvalPoint = GoldilocksExt3.Ext3(
-            openings.wires[shiftedEvalStart].c0, openings.wires[shiftedEvalStart + 1].c0, 0
-        );
+        GoldilocksExt3.Ext3 memory evalPoint0 = openings.wires[evalPointStart];
+        GoldilocksExt3.Ext3 memory evalPoint1 = openings.wires[evalPointStart + 1];
+        GoldilocksExt3.Ext3 memory shiftedEvalPoint0 = openings.wires[shiftedEvalStart];
+        GoldilocksExt3.Ext3 memory shiftedEvalPoint1 = openings.wires[shiftedEvalStart + 1];
 
         // Constraint 0-1 (D=2): evaluation_point - shifted_evaluation_point * shift = 0
-        GoldilocksExt3.Ext3 memory diff0 = evalPoint.sub(shiftedEvalPoint.mul(shift));
-        c[0] = GoldilocksExt3.fromBase(diff0.c0);
-        c[1] = GoldilocksExt3.fromBase(diff0.c1);
+        // shift is base field, so scaling each component of the circuit Ext2 pair
+        GoldilocksExt3.Ext3 memory diff0_0 = evalPoint0.sub(shiftedEvalPoint0.mul(shift));
+        GoldilocksExt3.Ext3 memory diff0_1 = evalPoint1.sub(shiftedEvalPoint1.mul(shift));
+        c[0] = diff0_0;
+        c[1] = diff0_1;
 
         // Intermediate constraints: 2*D per intermediate
         uint256 cIdx = D;
@@ -704,26 +746,24 @@ contract Plonky2Verifier {
         if (numIntermediates > 0) {
             uint256 lastEvalBase = intEvalStart + (numIntermediates - 1) * D;
             uint256 lastProdBase = intProdStart + (numIntermediates - 1) * D;
-            GoldilocksExt3.Ext3 memory lastEval = GoldilocksExt3.Ext3(
-                openings.wires[lastEvalBase].c0, openings.wires[lastEvalBase + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory lastProd = GoldilocksExt3.Ext3(
-                openings.wires[lastProdBase].c0, openings.wires[lastProdBase + 1].c0, 0
-            );
-            GoldilocksExt3.Ext3 memory evalValue = GoldilocksExt3.Ext3(
-                openings.wires[evalValueStart].c0, openings.wires[evalValueStart + 1].c0, 0
-            );
+            GoldilocksExt3.Ext3 memory lastEval0 = openings.wires[lastEvalBase];
+            GoldilocksExt3.Ext3 memory lastEval1 = openings.wires[lastEvalBase + 1];
+            GoldilocksExt3.Ext3 memory lastProd0 = openings.wires[lastProdBase];
+            GoldilocksExt3.Ext3 memory lastProd1 = openings.wires[lastProdBase + 1];
+            GoldilocksExt3.Ext3 memory evalValue0 = openings.wires[evalValueStart];
+            GoldilocksExt3.Ext3 memory evalValue1 = openings.wires[evalValueStart + 1];
             // finalEval = lastEval / lastProd
-            // constraint: evalValue * lastProd - lastEval = 0
-            GoldilocksExt3.Ext3 memory finalDiff = evalValue.mul(lastProd).sub(lastEval);
-            c[numConstraints - 2] = GoldilocksExt3.fromBase(finalDiff.c0);
-            c[numConstraints - 1] = GoldilocksExt3.fromBase(finalDiff.c1);
+            // constraint: evalValue * lastProd - lastEval = 0 (circuit Ext2 mul)
+            (GoldilocksExt3.Ext3 memory vp0, GoldilocksExt3.Ext3 memory vp1) =
+                _circuitExt2Mul(evalValue0, evalValue1, lastProd0, lastProd1);
+            c[numConstraints - 2] = vp0.sub(lastEval0);
+            c[numConstraints - 1] = vp1.sub(lastEval1);
         }
 
         return c;
     }
 
-    /// @dev PoseidonMdsGate: MDS matrix multiplication on 12 extension elements
+    /// @dev PoseidonMdsGate: MDS matrix multiplication on 12 circuit extension elements
     ///      output[r] = Σ MDS_CIRC[i] * input[(i+r)%12] + MDS_DIAG[r] * input[r]
     ///      24 constraints (12 outputs × D=2)
     function _evalPoseidonMdsGate(
@@ -733,35 +773,36 @@ contract Plonky2Verifier {
         uint256 W = 12; // SPONGE_WIDTH
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](W * D);
 
-        // Read 12 input extension elements
-        GoldilocksExt3.Ext3[12] memory inputs;
+        // Read 12 input circuit extension elements (each is D=2 consecutive Ext3 wires)
+        // inputs[i] is a pair (inputs0[i], inputs1[i])
+        GoldilocksExt3.Ext3[12] memory inputs0;
+        GoldilocksExt3.Ext3[12] memory inputs1;
         for (uint256 i = 0; i < W; i++) {
-            inputs[i] = GoldilocksExt3.Ext3(
-                openings.wires[i * D].c0,
-                openings.wires[i * D + 1].c0,
-                0
-            );
+            inputs0[i] = openings.wires[i * D];
+            inputs1[i] = openings.wires[i * D + 1];
         }
 
         // For each output row r, compute MDS multiplication
+        // MDS constants are base field scalars, so they scale each component of the circuit Ext2 pair
         for (uint256 r = 0; r < W; r++) {
-            GoldilocksExt3.Ext3 memory acc = GoldilocksExt3.zero();
+            GoldilocksExt3.Ext3 memory acc0 = GoldilocksExt3.zero();
+            GoldilocksExt3.Ext3 memory acc1 = GoldilocksExt3.zero();
             for (uint256 i = 0; i < W; i++) {
                 uint256 idx = (i + r) % W;
-                acc = acc.add(GoldilocksExt3.mulScalarU256(inputs[idx], PoseidonConstants.mdsCirc(i)));
+                uint64 mdsVal = uint64(PoseidonConstants.mdsCirc(i));
+                acc0 = acc0.add(inputs0[idx].mulScalar(mdsVal));
+                acc1 = acc1.add(inputs1[idx].mulScalar(mdsVal));
             }
-            acc = acc.add(GoldilocksExt3.mulScalarU256(inputs[r], PoseidonConstants.mdsDiag(r)));
+            uint64 diagVal = uint64(PoseidonConstants.mdsDiag(r));
+            acc0 = acc0.add(inputs0[r].mulScalar(diagVal));
+            acc1 = acc1.add(inputs1[r].mulScalar(diagVal));
 
-            // Read output extension element
-            GoldilocksExt3.Ext3 memory output = GoldilocksExt3.Ext3(
-                openings.wires[(W + r) * D].c0,
-                openings.wires[(W + r) * D + 1].c0,
-                0
-            );
+            // Read output circuit extension element
+            GoldilocksExt3.Ext3 memory output0 = openings.wires[(W + r) * D];
+            GoldilocksExt3.Ext3 memory output1 = openings.wires[(W + r) * D + 1];
 
-            GoldilocksExt3.Ext3 memory diff = output.sub(acc);
-            c[r * D] = GoldilocksExt3.fromBase(diff.c0);
-            c[r * D + 1] = GoldilocksExt3.fromBase(diff.c1);
+            c[r * D] = output0.sub(acc0);
+            c[r * D + 1] = output1.sub(acc1);
         }
         return c;
     }
@@ -809,8 +850,8 @@ contract Plonky2Verifier {
         uint256 numChunks,
         GoldilocksExt3.Ext3[] memory terms
     ) internal pure {
-        GoldilocksExt3.Ext3 memory beta = GoldilocksExt3.fromBaseU256(betaBase);
-        GoldilocksExt3.Ext3 memory gamma = GoldilocksExt3.fromBaseU256(gammaBase);
+        GoldilocksExt3.Ext3 memory beta = GoldilocksExt3.fromBase(uint64(betaBase));
+        GoldilocksExt3.Ext3 memory gamma = GoldilocksExt3.fromBase(uint64(gammaBase));
         GoldilocksExt3.Ext3 memory betaZeta = beta.mul(zeta);
         uint256 partialIdx = ch * params.numPartialProducts;
 
@@ -854,7 +895,7 @@ contract Plonky2Verifier {
         GoldilocksExt3.Ext3 memory denProd = GoldilocksExt3.one();
         for (uint256 j = p.chunkStart; j < p.chunkEnd; j++) {
             GoldilocksExt3.Ext3 memory wireVal = openings.wires[j];
-            numProd = numProd.mul(wireVal.add(GoldilocksExt3.mulScalarU256(betaZeta, permData.kIs[j])).add(gamma));
+            numProd = numProd.mul(wireVal.add(betaZeta.mulScalar(uint64(permData.kIs[j]))).add(gamma));
             denProd = denProd.mul(wireVal.add(beta.mul(openings.plonkSigmas[j])).add(gamma));
         }
 
@@ -872,7 +913,7 @@ contract Plonky2Verifier {
     ) internal pure returns (GoldilocksExt3.Ext3[] memory) {
         GoldilocksExt3.Ext3[] memory result = new GoldilocksExt3.Ext3[](numChallenges);
         for (uint256 i = 0; i < numChallenges; i++) {
-            GoldilocksExt3.Ext3 memory alpha = GoldilocksExt3.fromBaseU256(alphas[i]);
+            GoldilocksExt3.Ext3 memory alpha = GoldilocksExt3.fromBase(uint64(alphas[i]));
             GoldilocksExt3.Ext3 memory acc = GoldilocksExt3.zero();
             for (uint256 j = terms.length; j > 0; j--) {
                 acc = acc.mul(alpha).add(terms[j - 1]);

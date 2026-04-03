@@ -276,4 +276,5 @@ library GoldilocksExt3 {
             mstore(add(result, 0x40), r2)
         }
     }
+
 }
