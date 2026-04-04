@@ -270,6 +270,20 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         assertTrue(reverted, "Tampered batch0 opening must be rejected");
     }
 
+    /// @notice Tampered gZeta → gZeta != g * zeta check must fail
+    function test_negative_tampered_gzeta() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt gZeta (flip 1 bit in c0)
+        proof.bridgeGZeta.gZeta.c0 = proof.bridgeGZeta.gZeta.c0 + 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered gZeta must be rejected");
+    }
+
     /// @notice External wrapper for try/catch (internal calls can't be caught)
     function verifyExternal(Proof memory proof) external view returns (bool) {
         return verify(proof);

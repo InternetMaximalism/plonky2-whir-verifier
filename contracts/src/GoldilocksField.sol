@@ -82,6 +82,17 @@ library GoldilocksField {
         return mul(numerator, inv(denominator));
     }
 
+    /// @dev Primitive root of unity of order 2^degreeBits.
+    ///      g = POWER_OF_TWO_GENERATOR^(2^(32-degreeBits))
+    ///      where POWER_OF_TWO_GENERATOR = 7277203076849721926 (Goldilocks TWO_ADICITY=32).
+    function primitiveRootOfUnity(uint256 degreeBits) internal pure returns (uint256) {
+        uint256 g = 7277203076849721926;
+        for (uint256 i = 0; i < 32 - degreeBits; i++) {
+            g = mulmod(g, g, P);
+        }
+        return g;
+    }
+
     /// @dev reduce_with_powers: Horner evaluation
     ///      result = terms[0] + terms[1]*alpha + terms[2]*alpha^2 + ...
     function reduceWithPowers(uint256[] memory terms, uint256 alpha) internal pure returns (uint256) {

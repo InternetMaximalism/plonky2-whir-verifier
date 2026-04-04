@@ -24,6 +24,14 @@ contract Plonky2Verifier {
     using GoldilocksField for uint256;
     using GoldilocksExt3 for GoldilocksExt3.Ext3;
 
+    /// @dev Interpolation state: (eval, prod) as circuit Ext2 pairs
+    struct InterpState {
+        GoldilocksExt3.Ext3 eval0;
+        GoldilocksExt3.Ext3 eval1;
+        GoldilocksExt3.Ext3 prod0;
+        GoldilocksExt3.Ext3 prod1;
+    }
+
     uint256 constant GL_P = GoldilocksField.P;
     /// @dev Unused selector sentinel value (matches Plonky2's UNUSED_SELECTOR)
     uint256 constant UNUSED_SELECTOR = 0xFFFFFFFF;
@@ -690,77 +698,124 @@ contract Plonky2Verifier {
     }
 
     /// @dev CosetInterpolationGate: Barycentric interpolation on a coset
-    ///      gateConfig: [subgroupBits, numPoints, numIntermediates, degree, barycentricWeights...]
+    ///      gateConfig: [subgroupBits, numPoints, numIntermediates, degree,
+    ///                   w0..w_{numPoints-1}, d0..d_{numPoints-1}]
     function _evalCosetInterpolationGate(
         Openings memory openings,
         uint256[] memory gateConfig
     ) internal pure returns (GoldilocksExt3.Ext3[] memory) {
         uint256 numPoints = gateConfig[1];
         uint256 numIntermediates = gateConfig[2];
+        uint256 degree = gateConfig[3];
         uint256 D = 2;
-        // Total constraints: D + D + 2*D*numIntermediates = D*(2 + 2*numIntermediates)
         uint256 numConstraints = D * (2 + 2 * numIntermediates);
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](numConstraints);
 
-        // Wire layout:
-        //   wire[0]: shift (base field)
-        //   wires[1..1+numPoints*D-1]: values (numPoints circuit extension elements)
-        //   wires[1+numPoints*D..+D-1]: evaluation_point (circuit extension element)
-        //   wires[1+numPoints*D+D..+D-1]: evaluation_value (output circuit extension element)
-        //   Non-routed:
-        //     intermediate_eval[i]: numIntermediates circuit extension elements
-        //     intermediate_prod[i]: numIntermediates circuit extension elements
-        //     shifted_evaluation_point: circuit extension element
-
+        // Wire layout indices
         uint256 evalPointStart = 1 + numPoints * D;
         uint256 evalValueStart = evalPointStart + D;
-        uint256 numRouted = evalValueStart + D;
-        uint256 intEvalStart = numRouted;
+        uint256 intEvalStart = evalValueStart + D;
         uint256 intProdStart = intEvalStart + numIntermediates * D;
         uint256 shiftedEvalStart = intProdStart + numIntermediates * D;
 
-        GoldilocksExt3.Ext3 memory shift = openings.wires[0];
-        GoldilocksExt3.Ext3 memory evalPoint0 = openings.wires[evalPointStart];
-        GoldilocksExt3.Ext3 memory evalPoint1 = openings.wires[evalPointStart + 1];
-        GoldilocksExt3.Ext3 memory shiftedEvalPoint0 = openings.wires[shiftedEvalStart];
-        GoldilocksExt3.Ext3 memory shiftedEvalPoint1 = openings.wires[shiftedEvalStart + 1];
-
-        // Constraint 0-1 (D=2): evaluation_point - shifted_evaluation_point * shift = 0
-        // shift is base field, so scaling each component of the circuit Ext2 pair
-        GoldilocksExt3.Ext3 memory diff0_0 = evalPoint0.sub(shiftedEvalPoint0.mul(shift));
-        GoldilocksExt3.Ext3 memory diff0_1 = evalPoint1.sub(shiftedEvalPoint1.mul(shift));
-        c[0] = diff0_0;
-        c[1] = diff0_1;
-
-        // Intermediate constraints: 2*D per intermediate
-        uint256 cIdx = D;
-        for (uint256 i = 0; i < numIntermediates; i++) {
-            // TODO: Full Barycentric interpolation constraint checking
-            c[cIdx++] = GoldilocksExt3.zero();
-            c[cIdx++] = GoldilocksExt3.zero();
-            c[cIdx++] = GoldilocksExt3.zero();
-            c[cIdx++] = GoldilocksExt3.zero();
+        // Constraint 0-1: evaluation_point - shifted_evaluation_point * shift = 0
+        {
+            GoldilocksExt3.Ext3 memory shift = openings.wires[0];
+            c[0] = openings.wires[evalPointStart].sub(openings.wires[shiftedEvalStart].mul(shift));
+            c[1] = openings.wires[evalPointStart + 1].sub(openings.wires[shiftedEvalStart + 1].mul(shift));
         }
 
-        // Final constraint (D=2): evaluation_value - final_computed_eval = 0
-        if (numIntermediates > 0) {
-            uint256 lastEvalBase = intEvalStart + (numIntermediates - 1) * D;
-            uint256 lastProdBase = intProdStart + (numIntermediates - 1) * D;
-            GoldilocksExt3.Ext3 memory lastEval0 = openings.wires[lastEvalBase];
-            GoldilocksExt3.Ext3 memory lastEval1 = openings.wires[lastEvalBase + 1];
-            GoldilocksExt3.Ext3 memory lastProd0 = openings.wires[lastProdBase];
-            GoldilocksExt3.Ext3 memory lastProd1 = openings.wires[lastProdBase + 1];
-            GoldilocksExt3.Ext3 memory evalValue0 = openings.wires[evalValueStart];
-            GoldilocksExt3.Ext3 memory evalValue1 = openings.wires[evalValueStart + 1];
-            // finalEval = lastEval / lastProd
-            // constraint: evalValue * lastProd - lastEval = 0 (circuit Ext2 mul)
-            (GoldilocksExt3.Ext3 memory vp0, GoldilocksExt3.Ext3 memory vp1) =
-                _circuitExt2Mul(evalValue0, evalValue1, lastProd0, lastProd1);
-            c[numConstraints - 2] = vp0.sub(lastEval0);
-            c[numConstraints - 1] = vp1.sub(lastEval1);
+        // Barycentric interpolation constraints via _cosetInterpConstraints helper
+        // Pack indices to avoid stack-too-deep
+        {
+            uint256[] memory idx = new uint256[](8);
+            idx[0] = numPoints; idx[1] = numIntermediates; idx[2] = degree;
+            idx[3] = intEvalStart; idx[4] = intProdStart;
+            idx[5] = evalValueStart; idx[6] = shiftedEvalStart; idx[7] = numConstraints;
+            _cosetInterpConstraints(openings, gateConfig, c, idx);
         }
 
         return c;
+    }
+
+    /// @dev Helper: compute intermediate + final constraints for CosetInterpolationGate.
+    ///      idx = [numPoints, numIntermediates, degree, intEvalStart, intProdStart,
+    ///             evalValueStart, shiftedEvalStart, numConstraints]
+    function _cosetInterpConstraints(
+        Openings memory openings,
+        uint256[] memory gateConfig,
+        GoldilocksExt3.Ext3[] memory c,
+        uint256[] memory idx
+    ) internal pure {
+        uint256 D = 2;
+        GoldilocksExt3.Ext3 memory z0 = openings.wires[idx[6]];
+        GoldilocksExt3.Ext3 memory z1 = openings.wires[idx[6] + 1];
+
+        InterpState memory st;
+        st.eval0 = GoldilocksExt3.zero(); st.eval1 = GoldilocksExt3.zero();
+        st.prod0 = GoldilocksExt3.one();  st.prod1 = GoldilocksExt3.zero();
+        _partialInterpolate(openings, gateConfig, idx[0], 0, idx[2], z0, z1, st);
+
+        uint256 cIdx = D;
+        for (uint256 i = 0; i < idx[1]; i++) {
+            uint256 eBase = idx[3] + i * D;  // intEvalStart offset
+            uint256 pBase = idx[4] + i * D;  // intProdStart offset
+
+            c[cIdx++] = openings.wires[eBase].sub(st.eval0);
+            c[cIdx++] = openings.wires[eBase + 1].sub(st.eval1);
+            c[cIdx++] = openings.wires[pBase].sub(st.prod0);
+            c[cIdx++] = openings.wires[pBase + 1].sub(st.prod1);
+
+            uint256 chunkStart = 1 + (idx[2] - 1) * (i + 1);
+            uint256 chunkEnd = chunkStart + idx[2] - 1;
+            if (chunkEnd > idx[0]) chunkEnd = idx[0];
+
+            st.eval0 = openings.wires[eBase]; st.eval1 = openings.wires[eBase + 1];
+            st.prod0 = openings.wires[pBase]; st.prod1 = openings.wires[pBase + 1];
+            _partialInterpolate(openings, gateConfig, idx[0], chunkStart, chunkEnd, z0, z1, st);
+        }
+
+        // Final: evalValue * lastProd - lastEval = 0
+        (GoldilocksExt3.Ext3 memory vp0, GoldilocksExt3.Ext3 memory vp1) =
+            _circuitExt2Mul(openings.wires[idx[5]], openings.wires[idx[5] + 1], st.prod0, st.prod1);
+        c[idx[7] - 2] = vp0.sub(st.eval0);
+        c[idx[7] - 1] = vp1.sub(st.eval1);
+    }
+
+    /// @dev Partial Barycentric interpolation fold (modifies st in-place via struct).
+    function _partialInterpolate(
+        Openings memory openings,
+        uint256[] memory gateConfig,
+        uint256 numPoints,
+        uint256 startIdx,
+        uint256 endIdx,
+        GoldilocksExt3.Ext3 memory z0,
+        GoldilocksExt3.Ext3 memory z1,
+        InterpState memory st
+    ) internal pure {
+        uint256 D = 2;
+        uint256 wOff = 4;           // weights offset in gateConfig
+        uint256 dOff = 4 + numPoints; // domain offset in gateConfig
+
+        for (uint256 j = startIdx; j < endIdx; j++) {
+            // term = z - domain[j] (circuit Ext2: subtract base scalar from c0 only)
+            GoldilocksExt3.Ext3 memory t0 = z0.sub(GoldilocksExt3.fromBase(uint64(gateConfig[dOff + j])));
+
+            // weighted value = value[j] * weight[j]
+            GoldilocksExt3.Ext3 memory wv0 = openings.wires[1 + j * D].mulScalar(uint64(gateConfig[wOff + j]));
+            GoldilocksExt3.Ext3 memory wv1 = openings.wires[1 + j * D + 1].mulScalar(uint64(gateConfig[wOff + j]));
+
+            // newEval = eval * term + weightedVal * prod
+            (GoldilocksExt3.Ext3 memory et0, GoldilocksExt3.Ext3 memory et1) =
+                _circuitExt2Mul(st.eval0, st.eval1, t0, z1);
+            (GoldilocksExt3.Ext3 memory wp0, GoldilocksExt3.Ext3 memory wp1) =
+                _circuitExt2Mul(wv0, wv1, st.prod0, st.prod1);
+            st.eval0 = et0.add(wp0);
+            st.eval1 = et1.add(wp1);
+
+            // newProd = prod * term
+            (st.prod0, st.prod1) = _circuitExt2Mul(st.prod0, st.prod1, t0, z1);
+        }
     }
 
     /// @dev PoseidonMdsGate: MDS matrix multiplication on 12 circuit extension elements

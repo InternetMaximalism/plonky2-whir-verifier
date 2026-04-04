@@ -1544,12 +1544,31 @@ fn _gate_config(id: &str) -> Vec<u64> {
     } else if id.contains("ExponentiationGate") {
         vec![extract("num_power_bits").unwrap_or(0)]
     } else if id.contains("CosetInterpolationGate") {
+        use plonky2::field::types::{Field as PlonkyField, PrimeField64};
+        use plonky2::field::goldilocks_field::GoldilocksField as GF;
+        use plonky2::field::interpolation::barycentric_weights;
+
         let subgroup_bits = extract("subgroup_bits").unwrap_or(0);
         let num_points = 1u64 << subgroup_bits;
-        // degree and num_intermediates are computed from config
         let degree = extract("degree").unwrap_or(2);
         let num_intermediates = if degree > 1 { (num_points - 2) / (degree - 1) } else { 0 };
-        vec![subgroup_bits, num_points, num_intermediates, degree]
+
+        // Compute domain (two_adic_subgroup) and barycentric weights
+        let domain: Vec<GF> = GF::two_adic_subgroup(subgroup_bits as usize);
+        let weights: Vec<GF> = barycentric_weights(
+            &domain.iter().map(|&x| (x, GF::ZERO)).collect::<Vec<_>>(),
+        );
+
+        let mut config = vec![subgroup_bits, num_points, num_intermediates, degree];
+        // Append barycentric weights as u64 values
+        for w in &weights {
+            config.push(w.to_canonical_u64());
+        }
+        // Append domain points as u64 values
+        for d in &domain {
+            config.push(d.to_canonical_u64());
+        }
+        config
     } else {
         vec![]
     }

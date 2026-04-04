@@ -5,6 +5,7 @@ import {Plonky2Verifier} from "./Plonky2Verifier.sol";
 import {SpongefishWhirVerify} from "./spongefish/SpongefishWhirVerify.sol";
 import {SumcheckBridgeVerifier} from "./spongefish/SumcheckBridgeVerifier.sol";
 import {GoldilocksExt3} from "./spongefish/GoldilocksExt3.sol";
+import {GoldilocksField} from "./GoldilocksField.sol";
 
 /// @title WhirPlonky2Verifier — On-chain verifier with immutable verifying key
 /// @notice The verifying key (circuit config + WHIR params) is set once at deployment
@@ -165,6 +166,13 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
 
         // Steps 2-3: Sumcheck bridges + binding
         _verifySumcheckBridges(proof, config.sessionName);
+
+        // Verify gZeta == g * zeta (g is the trace subgroup generator)
+        {
+            uint256 g = GoldilocksField.primitiveRootOfUnity(config.degreeBits);
+            GoldilocksExt3.Ext3 memory expectedGZeta = proof.bridgeZeta.zeta.mulScalar(uint64(g));
+            require(GoldilocksExt3.eq(expectedGZeta, proof.bridgeGZeta.gZeta), "gZeta != g * zeta");
+        }
 
         // Step 4: Verify batch 0 (constants_sigmas) commitment
         _verifyBatch0Commitment(proof, config);
