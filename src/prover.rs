@@ -1838,6 +1838,26 @@ where
     };
 
     // -----------------------------------------------------------------------
+    // Compute constants_sigmas hash for VK binding (batch 0 commitment)
+    // -----------------------------------------------------------------------
+    let batch0_coeffs = polys_to_whir_field(
+        &circuit_data.prover_only.constants_sigmas_commitment.polynomials,
+    );
+    let batch0_hash_hex = {
+        use sha3::{Digest, Keccak256};
+        let mut bytes = Vec::with_capacity(batch0_coeffs.len() * 8);
+        for c in &batch0_coeffs {
+            bytes.extend_from_slice(&c.into_bigint().0[0].to_le_bytes());
+        }
+        let hash = Keccak256::digest(&bytes);
+        format!("0x{}", hex::encode(hash))
+    };
+    let batch0_coeffs_u64: Vec<u64> = batch0_coeffs
+        .iter()
+        .map(|c| c.into_bigint().0[0])
+        .collect();
+
+    // -----------------------------------------------------------------------
     // Assemble unified JSON
     // -----------------------------------------------------------------------
     // Split into VK (verifying key) and proof data
@@ -1858,6 +1878,7 @@ where
                 "kIs": k_is,
             },
             "sessionName": commitment.session_name,
+            "constantsSigmasHash": batch0_hash_hex,
         },
         "whirParams": whir_params,
         "protocolId": protocol_id,
@@ -1879,6 +1900,7 @@ where
         "publicInputs": proof.standard_proof.public_inputs.iter()
             .map(|f| f.to_canonical_u64())
             .collect::<Vec<_>>(),
+        "batch0Coefficients": batch0_coeffs_u64,
     });
 
     // Return combined (for backward compat) with clear separation

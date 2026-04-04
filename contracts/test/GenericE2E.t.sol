@@ -242,6 +242,34 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         assertTrue(reverted, "VK re-initialization must be rejected");
     }
 
+    /// @notice Tampered batch 0 coefficient → hash check must fail
+    function test_negative_tampered_batch0_coeff() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt one coefficient in batch 0
+        proof.batch0Coefficients[0] = proof.batch0Coefficients[0] ^ 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered batch0 coefficient must be rejected");
+    }
+
+    /// @notice Tampered batch 0 opening with correct coefficients → opening check must fail
+    function test_negative_tampered_batch0_opening() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt a batch 0 opening (selector evaluation) while keeping coefficients intact
+        proof.allOpeningsAtZetaFlat[0][0] = proof.allOpeningsAtZetaFlat[0][0] ^ 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered batch0 opening must be rejected");
+    }
+
     /// @notice External wrapper for try/catch (internal calls can't be caught)
     function verifyExternal(Proof memory proof) external view returns (bool) {
         return verify(proof);
@@ -1031,6 +1059,7 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         proof.batch2OpeningsAtGZetaFlat = abi.decode(vm.parseJson(json, ".batch2OpeningsAtGZetaFlat"), (uint256[]));
         proof.batchEvalsAtGZetaFlat = abi.decode(vm.parseJson(json, ".batchEvalsAtGZetaFlat"), (uint256[]));
         proof.publicInputs = abi.decode(vm.parseJson(json, ".publicInputs"), (uint256[]));
+        proof.batch0Coefficients = abi.decode(vm.parseJson(json, ".batch0Coefficients"), (uint256[]));
     }
 
     function _parseBridgeZetaDirect(string memory json)
@@ -1212,6 +1241,7 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         config.batchSizes = abi.decode(vm.parseJson(json, ".circuitConfig.batchSizes"), (uint256[]));
         config.intraBatchPolyCounts = abi.decode(vm.parseJson(json, ".circuitConfig.intraBatchPolyCounts"), (uint256[]));
         config.sessionName = abi.decode(vm.parseJson(json, ".circuitConfig.sessionName"), (string));
+        config.constantsSigmasHash = vm.parseJsonBytes32(json, ".circuitConfig.constantsSigmasHash");
 
         // Parse gates
         uint256[] memory gateTypes = abi.decode(vm.parseJson(json, ".circuitConfig.gates..gateType"), (uint256[]));
