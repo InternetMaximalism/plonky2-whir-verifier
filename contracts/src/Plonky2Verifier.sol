@@ -775,11 +775,10 @@ contract Plonky2Verifier {
             _partialInterpolate(openings, gateConfig, idx[0], chunkStart, chunkEnd, z0, z1, st);
         }
 
-        // Final: evalValue * lastProd - lastEval = 0
-        (GoldilocksExt3.Ext3 memory vp0, GoldilocksExt3.Ext3 memory vp1) =
-            _circuitExt2Mul(openings.wires[idx[5]], openings.wires[idx[5] + 1], st.prod0, st.prod1);
-        c[idx[7] - 2] = vp0.sub(st.eval0);
-        c[idx[7] - 1] = vp1.sub(st.eval1);
+        // Final: evaluation_value - computed_eval = 0
+        // Matches Rust: constraints.extend((evaluation_value - computed_eval).to_basefield_array())
+        c[idx[7] - 2] = openings.wires[idx[5]].sub(st.eval0);
+        c[idx[7] - 1] = openings.wires[idx[5] + 1].sub(st.eval1);
     }
 
     /// @dev Partial Barycentric interpolation fold (modifies st in-place via struct).
