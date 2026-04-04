@@ -2,23 +2,23 @@
 
 Generic Plonky2 → WHIR post-quantum verification pipeline with sumcheck binding.
 
-Plonky2 の FRI 多項式コミットメントを **WHIR** (Keccak/SHA3 ベース) に置き換え、**sumcheck inner product argument** で暗号学的に sound な binding を実現するシステムです。
+Replaces Plonky2's FRI polynomial commitment with **WHIR** (Keccak/SHA3-based), achieving cryptographic soundness through a **sumcheck inner product argument** bridge.
 
 ## Soundness Architecture
 
-従来のアプローチ（WHIR と制約チェックを独立に実行）では、WHIR がコミットした多項式と制約検証に使われる openings の間にバインディングがなく、悪意あるプルーバーが偽の openings を提出できる脆弱性がありました。
+A naive approach — running WHIR and constraint checks independently — leaves no binding between the WHIR-committed polynomial and the openings used for constraint verification, allowing a malicious prover to submit forged openings.
 
-本システムでは **sumcheck inner product argument** を導入し、univariate 評価を multilinear 評価に帰着させることで、この問題を解決しています。
+This system introduces a **sumcheck inner product argument** that reduces univariate evaluation to multilinear evaluation, closing this gap.
 
 ### Off-chain Prover (Rust)
 
 ```
 Plonky2 Prover
-├─ W(x), Z(x), σ(x), Q(x) の係数を生成
-├─ 連結して MLE にコミット（WHIR / Keccak256）
-├─ ζ を WHIR transcript から Fiat-Shamir で導出
-├─ sumcheck で ⟨f, h_ζ⟩ = p(ζ) を証明          ← binding
-│   └─ n ラウンド (degree 2/round, n = log₂(poly_size))
+├─ Generate coefficients for W(x), Z(x), σ(x), Q(x)
+├─ Concatenate into MLE and commit (WHIR / Keccak256)
+├─ Derive ζ from WHIR transcript via Fiat-Shamir
+├─ Prove ⟨f, h_ζ⟩ = p(ζ) via sumcheck            ← binding
+│   └─ n rounds (degree 2/round, n = log₂(poly_size))
 └─ WHIR evaluation proof: f(r) = v at sumcheck point r
 ```
 
@@ -26,21 +26,21 @@ Plonky2 Prover
 
 ```
 On-chain Verifier
-├─ sumcheck を検証（n ラウンド分の多項式一致チェック）
-├─ WHIR evaluation proof を検証
-├─ h_ζ(r) を計算して f(r) · h_ζ(r) = claimed_value を確認
-└─ openings で Plonky2 制約チェック（vanishing poly check）
+├─ Verify sumcheck (n rounds of polynomial consistency checks)
+├─ Verify WHIR evaluation proof
+├─ Compute h_ζ(r) and check f(r) · h_ζ(r) = claimed_value
+└─ Plonky2 constraint check using verified openings (vanishing poly check)
 ```
 
 ### Why Sumcheck?
 
-| 問題 | 原因 | 解決 |
-|------|------|------|
-| WHIR は MLE (multilinear) で動作 | Plonky2 は univariate p(ζ) が必要 | sumcheck で ⟨f, h_ζ⟩ = p(ζ) に帰着 |
-| openings と commitment が未結合 | evaluation proof が欠如 | sumcheck → WHIR eval proof で binding |
-| チャレンジがオフチェーン計算 | Fiat-Shamir 再導出なし | WHIR transcript から ζ を on-chain で導出 |
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| WHIR operates on MLE (multilinear) | Plonky2 requires univariate p(ζ) | Reduce via sumcheck: ⟨f, h_ζ⟩ = p(ζ) |
+| Openings unbound to commitment | Missing evaluation proof | Sumcheck → WHIR eval proof for binding |
+| Challenges computed off-chain | No Fiat-Shamir re-derivation | Derive ζ on-chain from WHIR transcript |
 
-**Soundness**: GoldilocksExt3 (|F| ≈ 2^192) 上で sumcheck error ≤ n·2/|F| ≈ **2^{-187}** (n=13).
+**Soundness**: Over GoldilocksExt3 (|F| ≈ 2^192), sumcheck error ≤ n·2/|F| ≈ **2^{-187}** (n=13).
 
 ## Full Verification Flow
 
@@ -53,37 +53,41 @@ On-chain Verifier
 │       ▼                                                     │
 │  prove_with_whir()                                          │
 │       ├── Plonky2 Prover → W, Z, σ, Q polynomials          │
-│       ├── 4 バッチに連結 → MLE f on {0,1}^n                  │
+│       ├── Concatenate 4 batches → MLE f on {0,1}^n         │
 │       ├── WHIR Commit(f) → Merkle root (Keccak256)          │
 │       ├── ζ ← Fiat-Shamir(WHIR transcript)                  │
 │       ├── Sumcheck: prove ⟨f, h_ζ⟩ = p(ζ)                   │
 │       │    └── n rounds → random point r ∈ F^n              │
 │       ├── WHIR Eval Proof: f(r) = v                         │
-│       └── Export: sumcheck proof + WHIR proof + openings    │
+│       └── Export: VK (test_vk.json) + Proof (test_proof.json)│
 └──────────────────────┬──────────────────────────────────────┘
                        │ JSON export
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  On-chain (Solidity)                                        │
 │                                                             │
-│  ┌───────────────────┐                                      │
-│  │ Sumcheck Verify    │ n ラウンドの g_i(0)+g_i(1) 一致検証  │
-│  └────────┬──────────┘                                      │
-│           ▼                                                 │
+│  Deploy: initialize(vk) — set verifying key once (immutable)│
+│                                                             │
+│  Verify: verify(proof)                                      │
 │  ┌───────────────────────┐                                  │
 │  │ SpongefishWhirVerify  │ WHIR eval proof: f(r) = v        │
 │  └────────┬──────────────┘                                  │
 │           ▼                                                 │
+│  ┌───────────────────┐                                      │
+│  │ Sumcheck Verify    │ n rounds of g_i(0)+g_i(1) checks    │
+│  └────────┬──────────┘                                      │
+│           ▼                                                 │
 │  ┌───────────────────────┐                                  │
-│  │ h_ζ(r) computation    │ verifier が h_ζ(r) を計算して     │
-│  │                       │ f(r) · h_ζ(r) = claim を確認     │
+│  │ h_ζ(r) computation    │ Compute h_ζ(r), verify           │
+│  │                       │ f(r) · h_ζ(r) = claim            │
 │  └────────┬──────────────┘                                  │
 │           ▼                                                 │
 │  ┌───────────────────────┐                                  │
-│  │ Plonky2Verifier       │ 制約充足検証 (vanishing poly)     │
+│  │ Plonky2Verifier       │ Constraint satisfaction check     │
+│  │                       │ (vanishing poly)                  │
 │  └───────────────────────┘                                  │
 │                                                             │
-│  全ステップ pass → 検証成功                                   │
+│  All steps pass → verification success                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,19 +101,16 @@ On-chain Verifier
 ### Build & Test
 
 ```bash
-# 1. Build the fixture generator
-cargo +nightly build --bin generate_fixture --release
-
-# 2. Generate test fixtures (outputs to contracts/test/data/)
+# 1. Generate test fixtures (outputs to contracts/test/data/)
 #    Fixtures are gitignored — you must generate them before running Solidity tests.
 cargo +nightly run --bin generate_fixture --release
 
-# 3. Run Solidity tests
+# 2. Run Solidity tests
 cd contracts
 forge test
 ```
 
-> **Note**: `forge test` will auto-generate fixtures via `vm.ffi` if `ffi = true` in `foundry.toml` and `test_constraint_data.json` is missing. However, this requires Rust nightly to be available in the shell. For reliability, run step 2 manually first.
+> **Note**: `forge test` will auto-generate fixtures via `vm.ffi` if `ffi = true` in `foundry.toml` and fixture files are missing. However, this requires Rust nightly to be available in the shell. For reliability, run step 1 manually first.
 
 ### Run Rust tests
 
@@ -127,35 +128,36 @@ plonky2-whir-verifier/
 │
 ├── src/                            # Rust library
 │   ├── lib.rs                      # Entry point (feature-gated)
-│   ├── prover.rs                   # WHIR prover/verifier + export (~1200 lines)
+│   ├── prover.rs                   # WHIR prover/verifier + export
 │   ├── sumcheck.rs                 # Sumcheck inner product prover/verifier
 │   ├── wrapper.rs                  # Generic wrapper circuit
 │   └── error.rs                    # Error types
 │
-├── tests/fixtures/                 # Rust test fixtures (JSON)
+├── docs/
+│   └── cryptographic-construction.md  # Full protocol specification
 │
 └── contracts/                      # Solidity (Foundry)
     ├── foundry.toml
     ├── src/
-    │   ├── WhirPlonky2Verifier.sol # 統一検証エントリポイント (verify())
-    │   ├── Plonky2Verifier.sol     # 制約充足検証
-    │   ├── GoldilocksField.sol     # Goldilocks 体演算 (p = 2^64 - 2^32 + 1)
-    │   ├── PoseidonConstants.sol   # Poseidon ラウンド定数
-    │   ├── PoseidonGateEval.sol    # Poseidon ゲート制約評価
+    │   ├── WhirPlonky2Verifier.sol # Unified verifier entry point (immutable VK + verify())
+    │   ├── Plonky2Verifier.sol     # Constraint satisfaction check
+    │   ├── GoldilocksField.sol     # Goldilocks field arithmetic (p = 2^64 - 2^32 + 1)
+    │   ├── PoseidonConstants.sol   # Poseidon round constants
+    │   ├── PoseidonGateEval.sol    # Poseidon gate constraint evaluation
     │   └── spongefish/
-    │       ├── SpongefishWhirVerify.sol  # WHIR 検証 (dual-point 対応)
+    │       ├── SpongefishWhirVerify.sol  # WHIR verification (dual-point)
     │       ├── SumcheckBridgeVerifier.sol # Sumcheck bridge + recomposition
-    │       ├── SpongefishWhir.sol        # WHIR トランスクリプト処理
-    │       ├── SpongefishMerkle.sol      # Merkle ツリー検証
-    │       ├── Keccak256Chain.sol        # Keccak スポンジ構成
-    │       ├── DuplexSponge.sol          # Duplex スポンジモード
-    │       ├── GoldilocksExt3.sol        # 3次拡大体 F_p[x]/(x^3-2)
-    │       ├── WhirLinearAlgebra.sol     # Sumcheck 線形代数
-    │       └── LibKeccak.sol            # Keccak256 プリミティブ
+    │       ├── SpongefishWhir.sol        # WHIR transcript processing
+    │       ├── SpongefishMerkle.sol      # Merkle tree verification
+    │       ├── Keccak256Chain.sol        # Keccak sponge construction
+    │       ├── DuplexSponge.sol          # Duplex sponge mode
+    │       ├── GoldilocksExt3.sol        # Cubic extension field F_p[x]/(x^3-2)
+    │       ├── WhirLinearAlgebra.sol     # Sumcheck linear algebra
+    │       └── LibKeccak.sol            # Keccak256 primitives
     └── test/
-        ├── GenericE2E.t.sol            # 汎用 E2E テスト
-        ├── Plonky2Verifier.t.sol       # 制約検証テスト
-        └── data/                       # テストフィクスチャ (gitignored, 自動生成)
+        ├── GenericE2E.t.sol            # Generic E2E tests
+        ├── Plonky2Verifier.t.sol       # Constraint verification tests
+        └── data/                       # Test fixtures (gitignored, auto-generated)
 ```
 
 ## Key Modules
@@ -164,21 +166,35 @@ plonky2-whir-verifier/
 
 | Module | Description |
 |--------|-------------|
-| `prover.rs` | `prove_with_whir()` / `verify_whir_plonky2_proof()` / `export_onchain_data()` — WHIR 証明生成・検証・エクスポート |
-| `sumcheck.rs` | `SumcheckProver::prove()` / `SumcheckVerifier::verify()` — univariate ↔ multilinear bridge |
-| `wrapper.rs` | `WrapperCircuit<F, InnerC, OuterC, D>` — 異なるコンフィグでの再証明用 |
-| `error.rs` | `WrapperProofFailed` / `InvalidProof` エラー型 |
+| `prover.rs` | `prove_with_whir()` / `verify_whir_plonky2_proof()` / `export_unified_proof()` — WHIR proof generation, verification, export |
+| `sumcheck.rs` | `sumcheck_prove()` / `sumcheck_verify()` — univariate ↔ multilinear bridge |
+| `wrapper.rs` | `WrapperCircuit<F, InnerC, OuterC, D>` — re-proving with different configs |
+| `error.rs` | `WrapperProofFailed` / `InvalidProof` error types |
 
 ### Solidity (`contracts/src/`)
 
 | Contract | Description |
 |----------|-------------|
-| `Plonky2Verifier` | 制約充足検証: vanishing poly == Z_H * quotient at ζ |
-| `SpongefishWhirVerify` | WHIR 多項式コミットメント検証 (sumcheck point 対応) |
-| `GoldilocksField` | Goldilocks 体の加算・乗算・逆元・べき乗 |
-| `GoldilocksExt3` | 3次拡大体演算 |
-| `PoseidonGateEval` | Poseidon ハッシュゲートの制約評価 |
-| `Keccak256Chain` | Keccak256 ベースの Fiat-Shamir トランスクリプト |
+| `WhirPlonky2Verifier` | Unified verifier: immutable VK + `verify(proof)` entry point |
+| `Plonky2Verifier` | Constraint satisfaction: vanishing poly == Z_H * quotient at ζ |
+| `SpongefishWhirVerify` | WHIR polynomial commitment verification (dual-point) |
+| `SumcheckBridgeVerifier` | Sumcheck bridge, recomposition, decomposition |
+| `GoldilocksField` | Goldilocks field: add, mul, inv, pow |
+| `GoldilocksExt3` | Cubic extension field arithmetic |
+| `PoseidonGateEval` | Poseidon hash gate constraint evaluation |
+| `Keccak256Chain` | Keccak256-based Fiat-Shamir transcript |
+
+## Contract Architecture
+
+```solidity
+// Deploy: set verifying key once (immutable, circuit-specific)
+verifier.initialize(circuitConfig, whirParams, protocolId, sessionId, instance);
+
+// Verify: submit proof only (no VK data needed)
+bool valid = verifier.verify(proof);
+```
+
+The verifying key (VK) contains circuit topology, WHIR protocol parameters, and session/protocol IDs. It is set once at deployment and cannot be changed. Only proofs are submitted for verification.
 
 ## Benchmarks
 
@@ -188,8 +204,8 @@ Measured on 2026-04-04 (rate=1/16, Ext3, Foundry v1.5.1, solc 0.8.29, via-ir).
 
 | Operation | Gas | Note |
 |-----------|-----|------|
-| **verify() (JSON parse除く)** | **~8.7M** | 本番on-chainコスト |
-| test_unified_verify (JSON parse込み) | 16.9M | forge test計測値 |
+| **verify() (excl. JSON parsing)** | **~8.7M** | Production on-chain cost |
+| test_unified_verify (incl. JSON parsing) | 18.2M | Forge test measurement |
 | WHIR dual-point verification | 6.1M | |
 | Sumcheck bridges (ζ + gζ) | 2.7M | |
 | Plonky2 constraint check (Ext3) | 2.0M | |
@@ -217,43 +233,26 @@ Measured on 2026-04-04 (rate=1/16, Ext3, Foundry v1.5.1, solc 0.8.29, via-ir).
 Solidity: 10 tests passed, 0 failed (GenericE2ETest)
 ```
 
-## Prerequisites
-
-- **Rust nightly** (plonky2 dependency requires `#![feature(specialization)]`)
-- **Foundry** (forge v1.5.1+)
-
-## Usage
-
-### Solidity Tests
-
-```bash
-cd contracts
-forge test -vv
-```
-
-### Gas Report
-
-```bash
-cd contracts
-forge test --gas-report
-```
-
-### Rust (requires nightly)
-
-```bash
-cargo +nightly test --release
-```
-
 ## Security Considerations
 
 ### Resolved Issues
 
-1. **Binding gap** (Critical): WHIR commitment と Plonky2 openings の間に暗号学的バインディングがなかった。sumcheck inner product argument で解決。
+1. **Binding gap** (Critical): No cryptographic binding between WHIR commitment and Plonky2 openings. Resolved via sumcheck inner product argument + recomposition check.
 
-2. **Fiat-Shamir challenges** (Critical): ζ, β, γ, α がオフチェーンで事前計算され、on-chain で再導出されていなかった。WHIR transcript (Keccak) からの導出で解決。
+2. **Fiat-Shamir challenges** (Critical): ζ, β, γ, α were pre-computed off-chain without on-chain re-derivation. Resolved by deriving all challenges on-chain from the WHIR Merkle root via Keccak.
+
+3. **Z(gζ) unverified** (Critical): Next-row evaluation for permutation check was unbound. Resolved via dual sumcheck bridge (second bridge at gζ) + batch2 sub-decomposition.
+
+4. **Ext2 embedding unsound**: Embedding Ext2 in Ext3 as (c0,c1,0) is not a field homomorphism — Ext3 multiplication produces nonzero c2. Resolved by migrating all arithmetic to native Ext3.
 
 ### Design Decisions
 
-- **Multilinear ↔ Univariate bridge**: WHIR は MLE (multilinear extension)、Plonky2 は univariate polynomial を使用。sumcheck で ⟨f, h_ζ⟩ = p(ζ) に帰着させることで、両者の代数構造の不整合を解消。
-- **Hash function**: WHIR transcript は Keccak256 (post-quantum)、Plonky2 内部は Poseidon。on-chain では Keccak 統一。
-- **Constraint check retention**: 制約チェック (~1.5M gas) は WHIR に統合せず独立に残す。統合には WHIR evaluation point の大改修が必要で、gas 削減効果が限定的なため。
+- **Multilinear ↔ Univariate bridge**: WHIR uses MLE (multilinear extension), Plonky2 uses univariate polynomials. The sumcheck reduces ⟨f, h_ζ⟩ = p(ζ), bridging the algebraic structures.
+- **Hash function**: WHIR transcript uses Keccak256 (post-quantum). Plonky2 internals use Poseidon. On-chain verification uses Keccak throughout.
+- **Immutable VK**: The verifying key is set at deployment and cannot be modified, preventing VK substitution attacks.
+- **Reed-Solomon rate**: 1/16 (starting_log_inv_rate=4) for optimal gas cost.
+- **Ext3 field**: F_p[x]/(x^3-2), p = 2^64 - 2^32 + 1. Provides ~2^192 security for Schwartz-Zippel.
+
+## Documentation
+
+- [`docs/cryptographic-construction.md`](docs/cryptographic-construction.md) — Complete protocol specification with soundness argument, field parameters, byte-level protocol flow, and security analysis.
