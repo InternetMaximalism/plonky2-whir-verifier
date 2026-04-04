@@ -609,8 +609,13 @@ pub fn whir_verify_standalone(
             .collect(),
     };
 
-    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
+    let mut verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
         vec![Box::new(MultilinearExtension::new(point))];
+
+    // For dual-point mode (ζ + gζ), add the second evaluation point
+    if let Some(ref ep_g) = commitment.eval_point_g_zeta {
+        verify_lf.push(Box::new(MultilinearExtension::new(ep_g.clone())));
+    }
 
     let mut verifier_state = VerifierState::new_std(&ds, &proof);
     let recv_commitment = params
