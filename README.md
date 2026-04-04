@@ -155,8 +155,7 @@ plonky2-whir-verifier/
     │       ├── WhirLinearAlgebra.sol     # Sumcheck linear algebra
     │       └── LibKeccak.sol            # Keccak256 primitives
     └── test/
-        ├── GenericE2E.t.sol            # Generic E2E tests
-        ├── Plonky2Verifier.t.sol       # Constraint verification tests
+        ├── GenericE2E.t.sol            # All E2E + negative tests (17 tests)
         └── data/                       # Test fixtures (gitignored, auto-generated)
 ```
 
@@ -230,8 +229,59 @@ Measured on 2026-04-04 (rate=1/16, Ext3, Foundry v1.5.1, solc 0.8.29, via-ir).
 ### Test Results
 
 ```
-Solidity: 10 tests passed, 0 failed (GenericE2ETest)
+Solidity: 17 tests passed, 0 failed (GenericE2ETest)
+
+Positive tests:
+  test_unified_verify          — full E2E via verify(proof) with immutable VK
+  test_full_e2e                — step-by-step verification flow
+  test_whir_combined           — WHIR polynomial commitment only
+  test_plonky2_constraints     — constraint satisfaction only
+  test_sumcheck_bridge         — sumcheck bridge verification
+  test_challenge_derivation    — on-chain challenge re-derivation
+  test_decomposition           — inter-batch decomposition
+  test_unified_parse_only      — JSON parsing gas measurement
+
+Negative tests (tampered proof must be rejected):
+  test_negative_tampered_opening        — wire opening 1-bit flip → recomposition fails
+  test_negative_tampered_zs_next        — Z(g*zeta) corruption → sub-decomposition fails
+  test_negative_tampered_public_input   — PI corruption → zeta mismatch (derived ≠ bridge)
+  test_negative_tampered_transcript     — Merkle root corruption → WHIR verification fails
+  test_negative_tampered_claimed_sum    — sumcheck claimed_sum corruption → binding fails
+  test_negative_tampered_batch_eval_gzeta — batch eval corruption → decomposition fails
+  test_negative_tampered_roundpoly      — round polynomial corruption → sumcheck fails
+  test_negative_vk_reinitialize         — VK re-initialization blocked
 ```
+
+## Test Fixtures
+
+All test fixtures are **gitignored** and must be generated locally before running tests.
+
+### Generation
+
+```bash
+cargo +nightly run --bin generate_fixture --release
+```
+
+This runs `src/bin/generate_fixture.rs`, which:
+1. Builds a Poseidon hash-chain circuit (10 iterations, 4 gates)
+2. Generates a Plonky2 proof
+3. Generates a WHIR polynomial commitment proof (dual-point)
+4. Exports the following files:
+
+| File | Contents | Used By |
+|------|----------|---------|
+| `test/data/test_vk.json` | Verifying key (circuit config + WHIR params + protocol/session IDs) | `test_unified_verify`, `test_negative_*` |
+| `test/data/test_proof.json` | Proof data (transcript, hints, evaluations, bridges, openings, PI) | `test_unified_verify`, `test_negative_*` |
+| `test/data/test_constraint_data.json` | Legacy format (openings + challenges + circuit config) | `test_full_e2e`, `test_plonky2_constraints`, etc. |
+| `test/data/whir/test_combined_verifier_data.json` | Legacy format (WHIR proof + sumcheck bridge) | `test_whir_combined`, `test_sumcheck_bridge`, etc. |
+
+### Why gitignored?
+
+Fixtures contain the WHIR Merkle root, which depends on random masking during commitment. Each generation produces different values. Committing fixtures would cause them to become stale and inconsistent with code changes.
+
+### Auto-generation
+
+`GenericE2E.t.sol`'s `setUp()` checks for fixture existence and auto-generates via `vm.ffi` if missing (requires `ffi = true` in `foundry.toml` and Rust nightly in PATH).
 
 ## Security Considerations
 
@@ -244,6 +294,8 @@ Solidity: 10 tests passed, 0 failed (GenericE2ETest)
 3. **Z(gζ) unverified** (Critical): Next-row evaluation for permutation check was unbound. Resolved via dual sumcheck bridge (second bridge at gζ) + batch2 sub-decomposition.
 
 4. **Ext2 embedding unsound**: Embedding Ext2 in Ext3 as (c0,c1,0) is not a field homomorphism — Ext3 multiplication produces nonzero c2. Resolved by migrating all arithmetic to native Ext3.
+
+5. **ζ mismatch attack** (Critical): Without an explicit check, a prover could submit openings verified at one ζ (from sumcheck bridge) while using tampered public inputs to derive a different ζ' for constraint checking. Resolved by requiring `derived_ζ == bridge_ζ` in `verify()`.
 
 ### Design Decisions
 

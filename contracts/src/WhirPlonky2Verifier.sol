@@ -320,6 +320,16 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
             config.numChallenges
         );
 
+        // CRITICAL: verify on-chain derived ζ == sumcheck bridge ζ.
+        // Without this check, a prover could submit openings verified at bridge ζ
+        // while using different challenges (from tampered inputs) at a different ζ'.
+        require(
+            zetaC0 == uint256(proof.bridgeZeta.zeta.c0) &&
+            zetaC1 == uint256(proof.bridgeZeta.zeta.c1) &&
+            zetaC2 == uint256(proof.bridgeZeta.zeta.c2),
+            "zeta mismatch: derived != bridge"
+        );
+
         Openings memory openings = _buildOpenings(proof, config, batch2PolyEvalsGZ);
 
         Challenges memory chal;

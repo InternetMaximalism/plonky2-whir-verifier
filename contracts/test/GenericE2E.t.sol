@@ -140,6 +140,117 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         assertTrue(proof.transcript.length > 0);
     }
 
+    // =====================================================================
+    // Negative tests — tampered proofs MUST be rejected
+    // =====================================================================
+
+    /// @notice Tampered wire opening → recomposition or constraint check must fail
+    function test_negative_tampered_opening() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt one wire opening (flip 1 bit in first element of batch 1)
+        proof.allOpeningsAtZetaFlat[1][0] = proof.allOpeningsAtZetaFlat[1][0] ^ 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered opening must be rejected");
+    }
+
+    /// @notice Tampered Z(gζ) → gζ sub-decomposition must fail
+    function test_negative_tampered_zs_next() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt Z(gζ) (first element of batch2 at gζ)
+        proof.batch2OpeningsAtGZetaFlat[0] = proof.batch2OpeningsAtGZetaFlat[0] ^ 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered Z(g*zeta) must be rejected");
+    }
+
+    /// @notice Tampered public input → challenge derivation changes, constraints fail
+    function test_negative_tampered_public_input() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt one public input
+        proof.publicInputs[0] = proof.publicInputs[0] ^ 1;
+
+        // verify() must revert with tampered PI (challenges change → constraints fail)
+        vm.expectRevert();
+        this.verifyExternal(proof);
+    }
+
+    /// @notice Tampered WHIR transcript → WHIR verification must fail
+    function test_negative_tampered_transcript() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt Merkle root (first byte of transcript)
+        bytes memory t = proof.transcript;
+        t[0] = bytes1(uint8(t[0]) ^ 1);
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered transcript must be rejected");
+    }
+
+    /// @notice Tampered sumcheck claimed_sum → binding check must fail
+    function test_negative_tampered_claimed_sum() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt claimed sum
+        proof.bridgeZeta.claimedSum.c0 = proof.bridgeZeta.claimedSum.c0 + 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered claimed_sum must be rejected");
+    }
+
+    /// @notice Tampered batch eval at gζ → inter-batch decomposition must fail
+    function test_negative_tampered_batch_eval_gzeta() public {
+        _initializeVK();
+        string memory proofJson = vm.readFile("test/data/test_proof.json");
+        Proof memory proof = _parseProof(proofJson);
+
+        // Corrupt batch-level eval at gζ
+        proof.batchEvalsAtGZetaFlat[0] = proof.batchEvalsAtGZetaFlat[0] ^ 1;
+
+        bool reverted = false;
+        try this.verifyExternal(proof) { } catch { reverted = true; }
+        assertTrue(reverted, "Tampered batch eval at g*zeta must be rejected");
+    }
+
+    /// @notice VK initialize() can only be called once
+    function test_negative_vk_reinitialize() public {
+        _initializeVK();
+
+        string memory vkJson = vm.readFile("test/data/test_vk.json");
+        CircuitConfig memory config = _parseCircuitConfig(vkJson);
+        SpongefishWhirVerify.WhirParams memory whirParams = _loadWhirParamsFromVK(vkJson);
+
+        bool reverted = false;
+        try this.initialize(config, whirParams, hex"00", hex"00", hex"") { } catch { reverted = true; }
+        assertTrue(reverted, "VK re-initialization must be rejected");
+    }
+
+    /// @notice External wrapper for try/catch (internal calls can't be caught)
+    function verifyExternal(Proof memory proof) external view returns (bool) {
+        return verify(proof);
+    }
+
+    // =====================================================================
+    // VK initialization helper
+    // =====================================================================
+
     bool private _vkInitialized;
 
     function _initializeVK() internal {
