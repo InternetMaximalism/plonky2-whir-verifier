@@ -306,7 +306,7 @@ contract GenericE2ETest is Test, WhirPlonky2Verifier {
         bytes memory sessionId = vm.parseJsonBytes(vkJson, ".sessionId");
         bytes memory instance = vm.parseJsonBytes(vkJson, ".instance");
 
-        this.initialize(config, whirParams, protocolId, sessionId, instance);
+        initialize(config, whirParams, protocolId, sessionId, instance);
     }
 
     // =====================================================================

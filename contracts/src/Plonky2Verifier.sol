@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "./GoldilocksField.sol";
 import "./PoseidonGateEval.sol";
 import "./PoseidonConstants.sol";
+import "./PoseidonHash.sol";
 import "./spongefish/GoldilocksExt3.sol";
 
 /// @title Plonky2Verifier — On-chain Plonky2 constraint satisfaction check
@@ -322,17 +323,19 @@ contract Plonky2Verifier {
         return c;
     }
 
-    /// @dev PublicInputGate: wire[i] - piHash[i] = 0 for i in 0..4
+    /// @dev PublicInputGate: wire[i] - hash(publicInputs)[i] = 0 for i in 0..4
+    ///      Plonky2 always hashes ALL public inputs via Poseidon hash_no_pad,
+    ///      then the gate enforces that the first 4 wires match the 4-element hash output.
     function _evalPublicInputGate(
         Openings memory openings,
         uint256[] memory publicInputs
     ) internal pure returns (GoldilocksExt3.Ext3[] memory) {
+        // SECURITY: Plonky2's verifier computes public_inputs_hash = hash_no_pad(public_inputs)
+        // and the PublicInputGate checks wire[i] == hash[i], not wire[i] == PI[i].
+        uint256[4] memory piHash = PoseidonHash.hashNoPad(publicInputs);
         GoldilocksExt3.Ext3[] memory c = new GoldilocksExt3.Ext3[](4);
         for (uint256 i = 0; i < 4; i++) {
-            GoldilocksExt3.Ext3 memory piVal = GoldilocksExt3.fromBase(
-                uint64(i < publicInputs.length ? publicInputs[i] : 0)
-            );
-            c[i] = openings.wires[i].sub(piVal);
+            c[i] = openings.wires[i].sub(GoldilocksExt3.fromBase(uint64(piHash[i])));
         }
         return c;
     }

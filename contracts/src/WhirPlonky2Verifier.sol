@@ -84,14 +84,15 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
     /// @dev Whether the verifying key has been initialized.
     bool internal _initialized;
 
+    /// @dev The address that deployed this contract (only this address can initialize).
+    address internal immutable _deployer;
+
     // -----------------------------------------------------------------------
     // Constructor — sets the verifying key permanently
     // -----------------------------------------------------------------------
 
     constructor() {
-        // Default constructor — VK must be set via initialize().
-        // This pattern allows the VK to contain dynamic arrays (gates, etc.)
-        // which can't be passed as constructor args easily with foundry.
+        _deployer = msg.sender;
     }
 
     /// @notice Initialize the verifying key. Can only be called ONCE.
@@ -102,8 +103,10 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
         bytes memory protocolId,
         bytes memory sessionId,
         bytes memory instance
-    ) external {
+    ) public {
         require(!_initialized, "VK already initialized");
+        // SECURITY: Only the deployer can initialize to prevent front-running attacks.
+        require(msg.sender == _deployer, "Only deployer can initialize");
         _initialized = true;
 
         // Store circuit config
@@ -225,6 +228,11 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
                 proof.bridgeZeta.zeta, evalPoint1
             );
             SumcheckBridgeVerifier.verifyBinding(proof.evaluations[0], hZetaR1, finalClaim1);
+
+            // SECURITY: Verify Fiat-Shamir derived evalPoint matches prover-supplied evalPoint.
+            // Without this, a prover could use a different evaluation point in WHIR than
+            // what the sumcheck bridge derives, breaking the protocol binding.
+            _requireEvalPointsEqual(evalPoint1, proof.bridgeZeta.evalPoint, "evalPoint zeta mismatch");
         }
 
         // Bridge #2 (g*zeta)
@@ -244,6 +252,21 @@ contract WhirPlonky2Verifier is Plonky2Verifier {
                 proof.bridgeGZeta.gZeta, evalPoint2
             );
             SumcheckBridgeVerifier.verifyBinding(proof.evaluations[1], hGZetaR2, finalClaim2);
+
+            // SECURITY: Same evalPoint binding check for g*zeta bridge.
+            _requireEvalPointsEqual(evalPoint2, proof.bridgeGZeta.evalPoint, "evalPoint gZeta mismatch");
+        }
+    }
+
+    /// @dev Verify two eval point arrays are element-wise equal (Fiat-Shamir binding).
+    function _requireEvalPointsEqual(
+        GoldilocksExt3.Ext3[] memory derived,
+        GoldilocksExt3.Ext3[] memory proofSupplied,
+        string memory errMsg
+    ) internal pure {
+        require(derived.length == proofSupplied.length, errMsg);
+        for (uint256 i = 0; i < derived.length; i++) {
+            require(GoldilocksExt3.eq(derived[i], proofSupplied[i]), errMsg);
         }
     }
 

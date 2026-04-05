@@ -1576,22 +1576,24 @@ fn _gate_config(id: &str) -> Vec<u64> {
 
 /// Map Plonky2 gate ID strings to numeric type IDs for Solidity.
 fn _gate_type_id(id: &str) -> u64 {
+    // SECURITY: More specific gate names must be checked BEFORE less specific ones
+    // to prevent substring false-matches (e.g., "PoseidonMdsGate" before "PoseidonGate").
     if id.contains("NoopGate") { 0 }
     else if id.contains("ConstantGate") { 1 }
     else if id.contains("PublicInputGate") { 2 }
+    else if id.contains("PoseidonMdsGate") { 15 }
     else if id.contains("PoseidonGate") { 3 }
+    else if id.contains("ArithmeticExtensionGate") { 9 }
     else if id.contains("ArithmeticGate") { 4 }
     else if id.contains("BaseSumGate") { 5 }
     else if id.contains("RandomAccessGate") { 6 }
     else if id.contains("ReducingExtensionGate") { 8 }
     else if id.contains("ReducingGate") { 7 }
     else if id.contains("MulExtensionGate") { 10 }
-    else if id.contains("ArithmeticExtensionGate") { 9 }
     else if id.contains("ExponentiationGate") { 11 }
     else if id.contains("CosetInterpolationGate") { 12 }
     else if id.contains("LookupTableGate") { 14 }
     else if id.contains("LookupGate") { 13 }
-    else if id.contains("PoseidonMdsGate") { 15 }
     else { 255 } // Unknown
 }
 
