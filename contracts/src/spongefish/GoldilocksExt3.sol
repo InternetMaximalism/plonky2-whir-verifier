@@ -120,9 +120,26 @@ library GoldilocksExt3 {
         }
     }
 
-    /// @dev Square an element (uses mul for now — can be specialized later)
-    function square(Ext3 memory a) internal pure returns (Ext3 memory) {
-        return mul(a, a);
+    /// @dev Square an element. Specialized formula: 6 mulmod vs 9 in mul().
+    ///   c0 = a0^2 + 4*a1*a2       (NONRESIDUE=2, so 2*2=4)
+    ///   c1 = 2*a0*a1 + 2*a2^2
+    ///   c2 = 2*a0*a2 + a1^2
+    function square(Ext3 memory a) internal pure returns (Ext3 memory r) {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let a0 := mload(a)
+            let a1 := mload(add(a, 0x20))
+            let a2 := mload(add(a, 0x40))
+
+            // c0 = a0^2 + 4*a1*a2
+            mstore(r, addmod(mulmod(a0, a0, p), mulmod(4, mulmod(a1, a2, p), p), p))
+
+            // c1 = 2*a0*a1 + 2*a2^2
+            mstore(add(r, 0x20), addmod(mulmod(2, mulmod(a0, a1, p), p), mulmod(2, mulmod(a2, a2, p), p), p))
+
+            // c2 = 2*a0*a2 + a1^2
+            mstore(add(r, 0x40), addmod(mulmod(2, mulmod(a0, a2, p), p), mulmod(a1, a1, p), p))
+        }
     }
 
     /// @dev Multiplicative inverse in F_p[x] / (x^3 - 2).
@@ -162,6 +179,55 @@ library GoldilocksExt3 {
             mstore(r, mulmod(s0, result, p))
             mstore(add(r, 0x20), mulmod(s1, result, p))
             mstore(add(r, 0x40), mulmod(s2, result, p))
+        }
+    }
+
+    /// @dev Compute a^(2^n) by repeated squaring
+    function expPowerOf2(Ext3 memory a, uint256 n) internal pure returns (Ext3 memory result) {
+        result = a;
+        for (uint256 i = 0; i < n; i++) {
+            result = square(result);
+        }
+    }
+
+    /// @dev Check equality
+    function isEqual(Ext3 memory a, Ext3 memory b) internal pure returns (bool) {
+        return a.c0 == b.c0 && a.c1 == b.c1 && a.c2 == b.c2;
+    }
+
+    /// @dev Evaluate L_0(x) = (x^n - 1) / (n * (x - 1)) where n = 2^degreeBits
+    function evalL0(Ext3 memory x, uint256 degreeBits) internal pure returns (Ext3 memory) {
+        uint256 n = 1 << degreeBits;
+        Ext3 memory xPowN = expPowerOf2(x, degreeBits);
+        Ext3 memory numerator = sub(xPowN, one());
+        Ext3 memory denominator = mulScalar(sub(x, one()), uint64(n));
+        return mul(numerator, inv(denominator));
+    }
+
+    /// @dev Horner evaluation: terms[0] + alpha*(terms[1] + alpha*(terms[2] + ...))
+    function reduceWithPowers(Ext3[] memory terms, Ext3 memory alpha) internal pure returns (Ext3 memory result) {
+        if (terms.length == 0) return zero();
+        result = zero();
+        for (uint256 i = terms.length; i > 0; i--) {
+            result = add(mul(result, alpha), terms[i - 1]);
+        }
+    }
+
+    /// @dev Scalar multiplication with uint256 (truncates to uint64 mod P)
+    function mulScalarU256(Ext3 memory a, uint256 s) internal pure returns (Ext3 memory r) {
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let sv := mod(s, p)
+            mstore(r, mulmod(mload(a), sv, p))
+            mstore(add(r, 0x20), mulmod(mload(add(a, 0x20)), sv, p))
+            mstore(add(r, 0x40), mulmod(mload(add(a, 0x40)), sv, p))
+        }
+    }
+
+    /// @dev Create Ext3 from uint256 base field element
+    function fromBaseU256(uint256 x) internal pure returns (Ext3 memory r) {
+        assembly {
+            mstore(r, mod(x, 0xFFFFFFFF00000001))
         }
     }
 
@@ -210,4 +276,5 @@ library GoldilocksExt3 {
             mstore(add(result, 0x40), r2)
         }
     }
+
 }

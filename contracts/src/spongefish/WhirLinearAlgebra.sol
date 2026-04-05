@@ -384,20 +384,51 @@ library WhirLinearAlgebra {
         }
     }
 
-    /// @dev Geometric sequence: [1, x, x^2, ..., x^(n-1)] — writes to pre-allocated array.
+    /// @dev Geometric sequence: [1, x, x^2, ..., x^(n-1)] — inline assembly.
     function geometricSequence(
         GoldilocksExt3.Ext3 memory x,
         uint256 n
     ) internal pure returns (GoldilocksExt3.Ext3[] memory result) {
         result = new GoldilocksExt3.Ext3[](n);
         if (n == 0) return result;
-        result[0] = GoldilocksExt3.one();
-        for (uint256 i = 1; i < n; i++) {
-            result[i] = result[i - 1].mul(x);
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let x0 := mload(x)
+            let x1 := mload(add(x, 0x20))
+            let x2 := mload(add(x, 0x40))
+
+            // result[0] = 1
+            let dataPtr := add(result, 0x20) // skip length slot
+            let elem0 := mload(dataPtr)      // pointer to first Ext3 struct
+            mstore(elem0, 1)
+            mstore(add(elem0, 0x20), 0)
+            mstore(add(elem0, 0x40), 0)
+
+            // result[i] = result[i-1] * x  (inline Ext3 mul)
+            let prev0 := 1
+            let prev1 := 0
+            let prev2 := 0
+            for { let i := 1 } lt(i, n) { i := add(i, 1) } {
+                // Ext3 mul: (prev) * (x)
+                let t1 := addmod(mulmod(prev1, x2, p), mulmod(prev2, x1, p), p)
+                let c0 := addmod(mulmod(prev0, x0, p), mulmod(2, t1, p), p)
+                let t2 := addmod(mulmod(prev0, x1, p), mulmod(prev1, x0, p), p)
+                let c1 := addmod(t2, mulmod(2, mulmod(prev2, x2, p), p), p)
+                let c2 := addmod(addmod(mulmod(prev0, x2, p), mulmod(prev1, x1, p), p), mulmod(prev2, x0, p), p)
+
+                let elemPtr := mload(add(dataPtr, mul(i, 0x20)))
+                mstore(elemPtr, c0)
+                mstore(add(elemPtr, 0x20), c1)
+                mstore(add(elemPtr, 0x40), c2)
+
+                prev0 := c0
+                prev1 := c1
+                prev2 := c2
+            }
         }
     }
 
-    /// @dev Tensor product of two vectors.
+    /// @dev Tensor product of two vectors — inline assembly.
     function tensorProduct(
         GoldilocksExt3.Ext3[] memory a,
         GoldilocksExt3.Ext3[] memory b
@@ -405,9 +436,37 @@ library WhirLinearAlgebra {
         uint256 aLen = a.length;
         uint256 bLen = b.length;
         result = new GoldilocksExt3.Ext3[](aLen * bLen);
-        for (uint256 i = 0; i < aLen; i++) {
-            for (uint256 j = 0; j < bLen; j++) {
-                result[i * bLen + j] = a[i].mul(b[j]);
+        assembly {
+            let p := 0xFFFFFFFF00000001
+            let aData := add(a, 0x20)
+            let bData := add(b, 0x20)
+            let rData := add(result, 0x20)
+
+            for { let i := 0 } lt(i, aLen) { i := add(i, 1) } {
+                let aPtr := mload(add(aData, mul(i, 0x20)))
+                let a0 := mload(aPtr)
+                let a1 := mload(add(aPtr, 0x20))
+                let a2 := mload(add(aPtr, 0x40))
+
+                for { let j := 0 } lt(j, bLen) { j := add(j, 1) } {
+                    let bPtr := mload(add(bData, mul(j, 0x20)))
+                    let b0 := mload(bPtr)
+                    let b1 := mload(add(bPtr, 0x20))
+                    let b2 := mload(add(bPtr, 0x40))
+
+                    // Ext3 mul inline
+                    let t1 := addmod(mulmod(a1, b2, p), mulmod(a2, b1, p), p)
+                    let c0 := addmod(mulmod(a0, b0, p), mulmod(2, t1, p), p)
+                    let t2 := addmod(mulmod(a0, b1, p), mulmod(a1, b0, p), p)
+                    let c1 := addmod(t2, mulmod(2, mulmod(a2, b2, p), p), p)
+                    let c2 := addmod(addmod(mulmod(a0, b2, p), mulmod(a1, b1, p), p), mulmod(a2, b0, p), p)
+
+                    let idx := add(mul(i, bLen), j)
+                    let rPtr := mload(add(rData, mul(idx, 0x20)))
+                    mstore(rPtr, c0)
+                    mstore(add(rPtr, 0x20), c1)
+                    mstore(add(rPtr, 0x40), c2)
+                }
             }
         }
     }

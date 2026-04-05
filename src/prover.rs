@@ -72,6 +72,8 @@ use whir::{
     transcript::{codecs::Empty, DomainSeparator, ProverState, VerifierState},
 };
 
+use crate::sumcheck::{self, SumcheckProof, SumcheckResult};
+
 use whir::hash;
 
 // ---------------------------------------------------------------------------
@@ -88,16 +90,25 @@ pub struct WhirWrapConfig {
 
 impl WhirWrapConfig {
     /// Default configuration optimized for on-chain Keccak verification.
+    /// Uses 80-bit security (standard for L2/on-chain applications).
     pub fn default_keccak() -> Self {
+        Self::with_security_level(80)
+    }
+
+    /// Configuration with custom security level.
+    /// - 80: standard for on-chain (smaller proofs, fewer queries)
+    /// - 100: conservative (larger proofs, more queries)
+    /// - 128: high security (largest proofs)
+    pub fn with_security_level(security_level: usize) -> Self {
         Self {
-            name: "keccak-rate2".to_string(),
+            name: format!("keccak-rate2-sec{}", security_level),
             params: ProtocolParameters {
-                security_level: 100,
+                security_level,
                 pow_bits: 0,
                 initial_folding_factor: 4,
                 folding_factor: 4,
                 unique_decoding: false,
-                starting_log_inv_rate: 2,
+                starting_log_inv_rate: 4,
                 batch_size: 1,
                 hash_id: hash::KECCAK,
             },
@@ -117,12 +128,38 @@ pub struct WhirPolyCommitment {
     pub proof_hints: Vec<u8>,
     /// Number of multilinear variables (log2 of padded polynomial length).
     pub num_variables: usize,
-    /// WHIR-proven evaluation at the canonical point.
+    /// WHIR-proven evaluations at the evaluation point(s).
+    /// Length 1 for single-point (legacy or ζ-only), length 2 for dual-point (ζ + gζ).
     pub evaluations: Vec<Field64_3>,
     /// Session label (for domain separation in Fiat-Shamir).
     pub session_name: String,
     /// Number of hash invocations during verification (for gas estimation).
     pub verify_hashes: usize,
+    /// Sumcheck proof bridging univariate p(ζ) to MLE evaluation at point r₁.
+    /// None for legacy (canonical point) mode.
+    pub sumcheck_proof: Option<SumcheckProof>,
+    /// The univariate evaluation point ζ (derived from WHIR transcript via Fiat-Shamir).
+    /// None for legacy mode.
+    pub zeta: Option<Field64_3>,
+    /// The sumcheck-derived evaluation point r₁ = (r₁_1, ..., r₁_n).
+    /// This is where WHIR proves the MLE evaluates for the ζ bridge.
+    /// None for legacy mode (uses canonical point).
+    pub eval_point: Option<Vec<Field64_3>>,
+    /// The claimed univariate evaluation p(ζ) = Σ c_i · ζ^i.
+    /// This is the sumcheck claimed sum. None for legacy mode.
+    pub claimed_sum: Option<Field64_3>,
+    /// Second sumcheck proof bridging univariate p(gζ) to MLE evaluation at point r₂.
+    /// None if dual-point evaluation is not used.
+    pub sumcheck_proof_g_zeta: Option<SumcheckProof>,
+    /// The shifted evaluation point gζ (g = generator of trace subgroup H).
+    /// None if dual-point evaluation is not used.
+    pub g_zeta: Option<Field64_3>,
+    /// The sumcheck-derived evaluation point r₂ for the gζ bridge.
+    /// None if dual-point evaluation is not used.
+    pub eval_point_g_zeta: Option<Vec<Field64_3>>,
+    /// The claimed univariate evaluation p(gζ) = Σ c_i · (gζ)^i.
+    /// None if dual-point evaluation is not used.
+    pub claimed_sum_g_zeta: Option<Field64_3>,
 }
 
 /// Complete WHIR-based Plonky2 proof.
@@ -147,6 +184,29 @@ pub struct WhirPlonky2Proof<F: RichField + Extendable<D>, C: GenericConfig<D, F 
     /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
     /// Each batch is already padded to a power of 2 by `polys_to_whir_field`.
     pub batch_sizes: Vec<usize>,
+
+    /// Evaluations of each batch polynomial at sumcheck.zeta (Ext3).
+    /// Used for on-chain decomposition check: P(ζ) = Σ batch_i(ζ) · ζ^offset_i.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub batch_evals_at_zeta: Vec<Field64_3>,
+
+    /// Evaluations of each batch polynomial at gζ (Ext3).
+    /// Used for on-chain decomposition of the second sumcheck bridge.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub batch_evals_at_g_zeta: Vec<Field64_3>,
+
+    /// Number of individual polynomials in each batch.
+    /// Order: [constants_sigmas, wires, zs_partial_products, quotient_chunks].
+    pub intra_batch_poly_counts: Vec<usize>,
+
+    /// Per-polynomial evaluations within each batch at ζ.
+    /// Each inner Vec has length intra_batch_poly_counts[i].
+    /// Used for intra-batch sub-decomposition on-chain.
+    pub intra_batch_evals_at_zeta: Vec<Vec<Field64_3>>,
+
+    /// Per-polynomial evaluations of batch 2 (zs_partial_products) at gζ.
+    /// Used to extract verified Z(gζ) for the permutation check.
+    pub batch2_evals_at_g_zeta: Vec<Field64_3>,
 
     /// Public input: `true` = validity proof, `false` = fraud proof.
     /// This is bound into the WHIR proof's Fiat-Shamir transcript.
@@ -285,6 +345,223 @@ fn whir_commit_and_prove(
         evaluations,
         session_name: session_name.to_string(),
         verify_hashes,
+        sumcheck_proof: None,
+        zeta: None,
+        eval_point: None,
+        claimed_sum: None,
+        sumcheck_proof_g_zeta: None,
+        g_zeta: None,
+        eval_point_g_zeta: None,
+        claimed_sum_g_zeta: None,
+    }
+}
+
+/// Generate a WHIR commitment with dual sumcheck bridges for sound binding.
+///
+/// Flow:
+/// 1. Commit to polynomial via WHIR (Merkle tree)
+/// 2. Use externally-derived ζ (from unified Keccak Fiat-Shamir, Ext2 embedded in Ext3)
+/// 3. Compute p(ζ) = Σ c_i · ζ^i and optionally p(gζ) = Σ c_i · (gζ)^i
+/// 4. Run sumcheck prover(s) to prove <f, h_ζ> = p(ζ) (and <f, h_{gζ}> = p(gζ))
+/// 5. WHIR evaluation proof at sumcheck-derived point(s)
+///
+/// The externally-derived ζ ensures the same evaluation point is used for both
+/// the sumcheck bridge and Plonky2 constraint checking (see `prove_with_whir`).
+///
+/// When `g_zeta` is provided, a second sumcheck bridge is run to prove p(gζ),
+/// which is needed for the permutation check's "next row" evaluation Z(gζ).
+fn whir_commit_and_prove_with_sumcheck(
+    polynomial: &[Field64],
+    session_name: &str,
+    config: &WhirWrapConfig,
+    zeta: Field64_3,
+    g_zeta: Option<Field64_3>,
+) -> WhirPolyCommitment {
+    use ark_ff::{Field as ArkField, PrimeField};
+    use sha3::{Digest, Keccak256};
+
+    let poly_size = polynomial.len();
+    let num_variables = poly_size.trailing_zeros() as usize;
+
+    let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+    let ds = DomainSeparator::protocol(&params)
+        .session(&session_name.to_string())
+        .instance(&Empty);
+
+    // === PHASE 1: COMMIT ===
+    let mut prover_state = ProverState::new_std(&ds);
+    let witness = params.commit(&mut prover_state, &[polynomial]);
+
+    // === PHASE 2: ζ is provided externally (unified with Plonky2 Keccak challenges) ===
+    // ζ is an Ext2 element embedded in Ext3 as (c0, c1, 0).
+    // Since polynomial coefficients are base-field (Goldilocks), evaluations
+    // at this embedded Ext2 point will also have c2=0.
+
+    // === PHASE 3: Compute p(ζ) = Σ c_i · ζ^i ===
+    let p_at_zeta = sumcheck::eval_univariate_via_mle(polynomial, zeta);
+
+    eprintln!(
+        "[whir-sumcheck] nv={}, p(ζ) computed, running sumcheck...",
+        num_variables
+    );
+
+    // === PHASE 4a: Sumcheck prover for ζ ===
+    let make_challenge_fn = |tag: &str, eval_point: &Field64_3| -> Box<dyn FnMut(&[Field64_3; 3]) -> Field64_3> {
+        let mut transcript = Keccak256::new();
+        transcript.update(tag.as_bytes());
+        transcript.update(session_name.as_bytes());
+        for c in ArkField::to_base_prime_field_elements(eval_point) {
+            transcript.update(&c.into_bigint().0[0].to_le_bytes());
+        }
+        Box::new(move |g: &[Field64_3; 3]| {
+            for eval in g {
+                let base_elems: Vec<_> = ArkField::to_base_prime_field_elements(eval).collect();
+                for b in &base_elems {
+                    transcript.update(&b.into_bigint().0[0].to_le_bytes());
+                }
+            }
+            let h = transcript.clone().finalize();
+            let c0 = u64::from_le_bytes(h[0..8].try_into().unwrap()) % Field64::MODULUS.0[0];
+            let c1 = u64::from_le_bytes(h[8..16].try_into().unwrap()) % Field64::MODULUS.0[0];
+            let c2 = u64::from_le_bytes(h[16..24].try_into().unwrap()) % Field64::MODULUS.0[0];
+            ark_ff::CubicExtField::new(Field64::from(c0), Field64::from(c1), Field64::from(c2))
+        })
+    };
+
+    let (sc_proof, sc_result) = sumcheck::sumcheck_prove(
+        polynomial,
+        zeta,
+        p_at_zeta,
+        make_challenge_fn("sumcheck-challenges", &zeta),
+    );
+    let eval_point = sc_result.point.clone();
+
+    eprintln!(
+        "[whir-sumcheck] sumcheck #1 done, {} rounds. eval_point derived.",
+        eval_point.len()
+    );
+
+    // === PHASE 4b: Optional second sumcheck for gζ ===
+    let (sc_proof_g, sc_result_g, eval_point_g, p_at_g_zeta) = if let Some(gz) = g_zeta {
+        let p_gz = sumcheck::eval_univariate_via_mle(polynomial, gz);
+        let (proof_g, result_g) = sumcheck::sumcheck_prove(
+            polynomial,
+            gz,
+            p_gz,
+            make_challenge_fn("sumcheck-challenges-gzeta", &gz),
+        );
+        let ep_g = result_g.point.clone();
+        eprintln!(
+            "[whir-sumcheck] sumcheck #2 (gζ) done, {} rounds.",
+            ep_g.len()
+        );
+        (Some(proof_g), Some(result_g), Some(ep_g), Some(p_gz))
+    } else {
+        (None, None, None, None)
+    };
+
+    // === PHASE 5: WHIR evaluation proof at point(s) ===
+    let lf1 = MultilinearExtension::new(eval_point.clone());
+    let eval1 = lf1.evaluate(params.embedding(), polynomial);
+
+    let (evaluations, prove_lf): (Vec<Field64_3>, Vec<Box<dyn LinearForm<Field64_3>>>) =
+        if let Some(ref ep_g) = eval_point_g {
+            let lf2 = MultilinearExtension::new(ep_g.clone());
+            let eval2 = lf2.evaluate(params.embedding(), polynomial);
+            (
+                vec![eval1, eval2],
+                vec![
+                    Box::new(MultilinearExtension::new(eval_point.clone())),
+                    Box::new(MultilinearExtension::new(ep_g.clone())),
+                ],
+            )
+        } else {
+            (
+                vec![eval1],
+                vec![Box::new(MultilinearExtension::new(eval_point.clone()))],
+            )
+        };
+
+    let _ = params.prove(
+        &mut prover_state,
+        vec![Cow::Owned(polynomial.to_vec())],
+        vec![Cow::Owned(witness)],
+        prove_lf,
+        Cow::Borrowed(evaluations.as_slice()),
+    );
+
+    let proof = prover_state.proof();
+    let proof_narg = proof.narg_string.clone();
+    let proof_hints = proof.hints.clone();
+
+    // === VERIFY (off-chain sanity check) ===
+    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> = if let Some(ref ep_g) = eval_point_g {
+        vec![
+            Box::new(MultilinearExtension::new(eval_point.clone())),
+            Box::new(MultilinearExtension::new(ep_g.clone())),
+        ]
+    } else {
+        vec![Box::new(MultilinearExtension::new(eval_point.clone()))]
+    };
+
+    HASH_COUNTER.reset();
+    let mut verifier_state = VerifierState::new_std(&ds, &proof);
+    let commitment = params
+        .receive_commitment(&mut verifier_state)
+        .expect("WHIR receive_commitment failed");
+    let final_claim = params
+        .verify(&mut verifier_state, &[&commitment], &evaluations)
+        .expect("WHIR verify failed");
+    final_claim
+        .verify(
+            verify_lf
+                .iter()
+                .map(|l| l.as_ref() as &dyn LinearForm<Field64_3>),
+        )
+        .expect("WHIR final_claim verify failed");
+    let verify_hashes = HASH_COUNTER.get();
+
+    // === Verify sumcheck #1 consistency ===
+    let h_at_r = sumcheck::eval_h_zeta(zeta, &eval_point);
+    let expected_final = eval1 * h_at_r;
+    assert_eq!(
+        sc_result.final_claim, expected_final,
+        "Sumcheck #1 final claim mismatch: claim != f(r₁) * h_ζ(r₁)"
+    );
+
+    // === Verify sumcheck #2 consistency (if applicable) ===
+    if let (Some(gz), Some(ref ep_g), Some(ref res_g)) = (g_zeta, &eval_point_g, &sc_result_g) {
+        let eval2 = evaluations[1];
+        let h_at_r2 = sumcheck::eval_h_zeta(gz, ep_g);
+        let expected_final2 = eval2 * h_at_r2;
+        assert_eq!(
+            res_g.final_claim, expected_final2,
+            "Sumcheck #2 final claim mismatch: claim != f(r2) * h_gz(r2)"
+        );
+    }
+
+    eprintln!(
+        "[whir-sumcheck] All checks passed. verify_hashes={}, dual={}",
+        verify_hashes,
+        g_zeta.is_some()
+    );
+
+    WhirPolyCommitment {
+        proof_narg,
+        proof_hints,
+        num_variables,
+        evaluations,
+        session_name: session_name.to_string(),
+        verify_hashes,
+        sumcheck_proof: Some(sc_proof),
+        zeta: Some(zeta),
+        eval_point: Some(eval_point),
+        claimed_sum: Some(p_at_zeta),
+        sumcheck_proof_g_zeta: sc_proof_g,
+        g_zeta,
+        eval_point_g_zeta: eval_point_g,
+        claimed_sum_g_zeta: p_at_g_zeta,
     }
 }
 
@@ -323,12 +600,22 @@ pub fn whir_verify_standalone(
         }
     };
 
-    let point: Vec<Field64_3> = (0..commitment.num_variables)
-        .map(|i| Field64_3::from((i + 1) as u64))
-        .collect();
+    // Use the stored evaluation point if available (sumcheck mode),
+    // otherwise fall back to the canonical point (legacy mode).
+    let point: Vec<Field64_3> = match &commitment.eval_point {
+        Some(p) => p.clone(),
+        None => (0..commitment.num_variables)
+            .map(|i| Field64_3::from((i + 1) as u64))
+            .collect(),
+    };
 
-    let verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
+    let mut verify_lf: Vec<Box<dyn LinearForm<Field64_3>>> =
         vec![Box::new(MultilinearExtension::new(point))];
+
+    // For dual-point mode (ζ + gζ), add the second evaluation point
+    if let Some(ref ep_g) = commitment.eval_point_g_zeta {
+        verify_lf.push(Box::new(MultilinearExtension::new(ep_g.clone())));
+    }
 
     let mut verifier_state = VerifierState::new_std(&ds, &proof);
     let recv_commitment = params
@@ -471,10 +758,91 @@ where
         batch_sizes
     );
 
-    let combined_whir = whir_commit_and_prove(
+    let session_name = format!("whir-plonky2-combined-{}", er_tag);
+
+    // Step 1: Generate initial WHIR proof at canonical point to extract Merkle root.
+    // The Merkle root is the first 32 bytes of proof_narg and is deterministic
+    // from the polynomial (independent of evaluation point).
+    let canonical_whir = whir_commit_and_prove(
         &combined_poly,
-        &format!("whir-plonky2-combined-{}", er_tag),
+        &session_name,
         whir_config,
+    );
+    let merkle_root: [u8; 32] = canonical_whir.proof_narg[0..32]
+        .try_into()
+        .expect("WHIR transcript must start with 32-byte Merkle root");
+    eprintln!("[whir] Merkle root: {}", hex::encode(&merkle_root));
+
+    // Step 2: Derive unified ζ from Merkle root + session + public inputs.
+    // This matches the on-chain derivation (both sides hash the same data).
+    // ζ is Ext2 embedded in Ext3 as (c0, c1, 0) so that base-field polynomial
+    // evaluations at ζ have c2=0, compatible with Plonky2Verifier's Ext2 arithmetic.
+    let (zeta_ext3, zeta_c0, zeta_c1, zeta_c2) = {
+        use sha3::{Digest, Keccak256};
+        const GL_P: u64 = 0xFFFFFFFF00000001u64;
+
+        let mut h = Keccak256::new();
+        h.update(b"plonky2-challenges-v2");
+        h.update(session_name.as_bytes());
+        h.update(&merkle_root);
+        for &pi in &standard_proof.public_inputs {
+            h.update(&pi.to_canonical_u64().to_le_bytes());
+        }
+        let mut state: Vec<u8> = h.finalize().to_vec();
+
+        let mut squeeze_u64 = || -> u64 {
+            let mut h2 = Keccak256::new();
+            h2.update(&state);
+            state = h2.finalize().to_vec();
+            u64::from_le_bytes(state[0..8].try_into().unwrap()) % GL_P
+        };
+
+        // Squeeze betas, gammas, alphas first (matching on-chain order)
+        let num_challenges = circuit_data.common.config.num_challenges;
+        let _betas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let _gammas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let _alphas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let c0 = squeeze_u64();
+        let c1 = squeeze_u64();
+        let c2 = squeeze_u64();
+
+        // Full Ext3 zeta (no Ext2 embedding — using native Ext3 throughout)
+        let zeta = ark_ff::CubicExtField::new(
+            Field64::from(c0),
+            Field64::from(c1),
+            Field64::from(c2),
+        );
+        (zeta, c0, c1, c2)
+    };
+
+    eprintln!(
+        "[whir] Unified ζ derived from Merkle root: c0={}, c1={}",
+        zeta_c0, zeta_c1
+    );
+
+    // Step 3: Compute g (generator of trace subgroup H) and gζ.
+    // g = ω^(1) where ω is the 2^degree_bits-th primitive root of unity.
+    let g_zeta_ext3 = {
+        use plonky2::field::types::PrimeField64;
+        let degree_bits = circuit_data.common.degree_bits();
+        // Goldilocks primitive root of unity for subgroup of order 2^degree_bits
+        let g_u64 = plonky2::field::goldilocks_field::GoldilocksField::primitive_root_of_unity(degree_bits)
+            .to_canonical_u64();
+        let g_ext3 = ark_ff::CubicExtField::new(
+            Field64::from(g_u64),
+            Field64::ZERO,
+            Field64::ZERO,
+        );
+        g_ext3 * zeta_ext3
+    };
+
+    // Step 4: Generate final WHIR proof with dual sumcheck bridges (ζ and gζ).
+    let combined_whir = whir_commit_and_prove_with_sumcheck(
+        &combined_poly,
+        &session_name,
+        whir_config,
+        zeta_ext3,
+        Some(g_zeta_ext3),
     );
 
     let whir_time = whir_start.elapsed();
@@ -483,10 +851,74 @@ where
     // Assemble proof
     // -----------------------------------------------------------------------
 
+    let zeta = combined_whir.zeta.expect("sumcheck bridge must set zeta");
+    let g_zeta = combined_whir.g_zeta.expect("dual bridge must set g_zeta");
+
+    // Compute batch evaluations at ζ and gζ for on-chain decomposition checks.
+    let b0 = polys_to_whir_field(&circuit_data.prover_only.constants_sigmas_commitment.polynomials);
+    let b1 = polys_to_whir_field(&polys.wires);
+    let b2 = polys_to_whir_field(&polys.zs_partial_products);
+    let b3 = polys_to_whir_field(&polys.quotient_chunks);
+
+    let batch_evals_at_zeta = vec![
+        sumcheck::eval_univariate_via_mle(&b0, zeta),
+        sumcheck::eval_univariate_via_mle(&b1, zeta),
+        sumcheck::eval_univariate_via_mle(&b2, zeta),
+        sumcheck::eval_univariate_via_mle(&b3, zeta),
+    ];
+
+    let batch_evals_at_g_zeta = vec![
+        sumcheck::eval_univariate_via_mle(&b0, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b1, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b2, g_zeta),
+        sumcheck::eval_univariate_via_mle(&b3, g_zeta),
+    ];
+
+    // Compute intra-batch sub-decomposition: per-polynomial evaluations.
+    // Within each batch, individual polynomials are concatenated with uniform
+    // degree N = 2^degree_bits. So batch_i(ζ) = Σ_j poly_j(ζ) · ζ^{j·N}.
+    let degree = 1usize << circuit_data.common.degree_bits();
+    let batch_polys_raw = [
+        &circuit_data.prover_only.constants_sigmas_commitment.polynomials,
+        &polys.wires,
+        &polys.zs_partial_products,
+        &polys.quotient_chunks,
+    ];
+
+    let intra_batch_poly_counts: Vec<usize> = batch_polys_raw.iter()
+        .map(|ps| ps.len())
+        .collect();
+
+    let intra_batch_evals_at_zeta: Vec<Vec<Field64_3>> = batch_polys_raw.iter()
+        .map(|ps| {
+            ps.iter().map(|p| {
+                let whir_coeffs: Vec<Field64> = p.coeffs.iter()
+                    .map(|c| Field64::from(c.to_canonical_u64()))
+                    .collect();
+                sumcheck::eval_univariate_via_mle_raw(&whir_coeffs, zeta, degree)
+            }).collect()
+        })
+        .collect();
+
+    // Per-polynomial evaluations of batch 2 (zs_partial_products) at gζ.
+    let batch2_evals_at_g_zeta: Vec<Field64_3> = polys.zs_partial_products.iter()
+        .map(|p| {
+            let whir_coeffs: Vec<Field64> = p.coeffs.iter()
+                .map(|c| Field64::from(c.to_canonical_u64()))
+                .collect();
+            sumcheck::eval_univariate_via_mle_raw(&whir_coeffs, g_zeta, degree)
+        })
+        .collect();
+
     let proof = WhirPlonky2Proof {
         standard_proof,
         combined_whir,
         batch_sizes,
+        batch_evals_at_zeta,
+        batch_evals_at_g_zeta,
+        intra_batch_poly_counts,
+        intra_batch_evals_at_zeta,
+        batch2_evals_at_g_zeta,
         expected_result,
     };
 
@@ -634,10 +1066,107 @@ pub fn export_whir_verifier_data(
         })
     }).collect();
 
-    // Canonical evaluation point
-    let point: Vec<String> = (0..commitment.num_variables)
-        .map(|i| format!("{}", i + 1))
-        .collect();
+    // Evaluation point: sumcheck-derived r if available, otherwise canonical
+    let point: Vec<serde_json::Value> = match &commitment.eval_point {
+        Some(p) => p.iter().map(|e| {
+            let base_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base_elems[0].into_bigint().0[0],
+                "c1": base_elems[1].into_bigint().0[0],
+                "c2": base_elems[2].into_bigint().0[0],
+            })
+        }).collect(),
+        None => (0..commitment.num_variables)
+            .map(|i| serde_json::json!({
+                "c0": i + 1,
+                "c1": 0,
+                "c2": 0,
+            }))
+            .collect(),
+    };
+
+    // Sumcheck bridge data (if present)
+    let sumcheck_data = match (&commitment.sumcheck_proof, &commitment.zeta, &commitment.claimed_sum) {
+        (Some(sc_proof), Some(zeta), Some(claimed_sum)) => {
+            let zeta_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(zeta).collect();
+            let cs_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(claimed_sum).collect();
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| {
+                    let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                    serde_json::json!({
+                        "c0": base[0].into_bigint().0[0],
+                        "c1": base[1].into_bigint().0[0],
+                        "c2": base[2].into_bigint().0[0],
+                    })
+                }).collect();
+                serde_json::json!(vals)
+            }).collect();
+            serde_json::json!({
+                "zeta": {
+                    "c0": zeta_elems[0].into_bigint().0[0],
+                    "c1": zeta_elems[1].into_bigint().0[0],
+                    "c2": zeta_elems[2].into_bigint().0[0],
+                },
+                "claimed_sum": {
+                    "c0": cs_elems[0].into_bigint().0[0],
+                    "c1": cs_elems[1].into_bigint().0[0],
+                    "c2": cs_elems[2].into_bigint().0[0],
+                },
+                "session_name": commitment.session_name,
+                "round_polys": round_polys,
+                "num_rounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
+    // Second sumcheck bridge data for gζ (if present)
+    let sumcheck_g_zeta_data = match (
+        &commitment.sumcheck_proof_g_zeta,
+        &commitment.g_zeta,
+        &commitment.claimed_sum_g_zeta,
+        &commitment.eval_point_g_zeta,
+    ) {
+        (Some(sc_proof), Some(gz), Some(claimed_sum), Some(eval_pt)) => {
+            let gz_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(gz).collect();
+            let cs_elems: Vec<_> = ark_ff::Field::to_base_prime_field_elements(claimed_sum).collect();
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| {
+                    let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                    serde_json::json!({
+                        "c0": base[0].into_bigint().0[0],
+                        "c1": base[1].into_bigint().0[0],
+                        "c2": base[2].into_bigint().0[0],
+                    })
+                }).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                serde_json::json!({
+                    "c0": base[0].into_bigint().0[0],
+                    "c1": base[1].into_bigint().0[0],
+                    "c2": base[2].into_bigint().0[0],
+                })
+            }).collect();
+            serde_json::json!({
+                "g_zeta": {
+                    "c0": gz_elems[0].into_bigint().0[0],
+                    "c1": gz_elems[1].into_bigint().0[0],
+                    "c2": gz_elems[2].into_bigint().0[0],
+                },
+                "claimed_sum": {
+                    "c0": cs_elems[0].into_bigint().0[0],
+                    "c1": cs_elems[1].into_bigint().0[0],
+                    "c2": cs_elems[2].into_bigint().0[0],
+                },
+                "eval_point": eval_point_json,
+                "round_polys": round_polys,
+                "num_rounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
 
     // Compute detailed WHIR protocol parameters for Solidity verifier
     let num_rounds = params.round_configs.len();
@@ -709,6 +1238,8 @@ pub fn export_whir_verifier_data(
         "num_variables": commitment.num_variables,
         "evaluations": evaluations_structured,
         "evaluation_point": point,
+        "sumcheck": sumcheck_data,
+        "sumcheck_g_zeta": sumcheck_g_zeta_data,
         "session_name": commitment.session_name,
         "whir_config": {
             "num_variables": commitment.num_variables,
@@ -778,8 +1309,7 @@ where
     C::InnerHasher: Hasher<F>,
 {
     use plonky2::field::types::PrimeField64;
-    use plonky2::iop::challenger::Challenger;
-    use plonky2::hash::hash_types::RichField as _;
+    use ark_ff::PrimeField as ArkPrimeField;
 
     let openings = &proof.standard_proof.proof.openings;
     let common = &circuit_data.common;
@@ -799,29 +1329,52 @@ where
         }).collect()
     };
 
-    // Re-derive Fiat-Shamir challenges (same as Plonky2's verifier)
+    // Derive Plonky2 challenges via Keccak (unified with WHIR transcript).
+    // This replaces Poseidon-based Plonky2 Challenger so challenges can be
+    // re-derived on-chain from the WHIR transcript bytes.
+    //
+    // Binding: the WHIR transcript encodes the Merkle commitment to all polynomials.
+    // Challenges derived from keccak(transcript) are therefore bound to the commitment.
     let num_challenges = common.config.num_challenges;
-    let public_inputs_hash = C::InnerHasher::hash_no_pad(&proof.standard_proof.public_inputs);
 
-    let mut challenger = Challenger::<F, C::Hasher>::new();
-    challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
-    challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.wires_cap);
+    let keccak_challenges = {
+        use sha3::{Digest, Keccak256};
 
-    let betas = challenger.get_n_challenges(num_challenges);
-    let gammas = challenger.get_n_challenges(num_challenges);
+        // Goldilocks prime: 2^64 - 2^32 + 1
+        const GL_P: u64 = 0xFFFFFFFF00000001u64;
 
-    // Skip lookup challenges if no lookups
-    if !common.luts.is_empty() {
-        let num_lookup_challenges = 4 * num_challenges; // NUM_COINS_LOOKUP * num_challenges
-        let _deltas = challenger.get_n_challenges(num_lookup_challenges - 2 * num_challenges);
-    }
+        // Derive challenges from Merkle root (v2) — matches on-chain deriveKeccakChallengesV2.
+        // The Merkle root is the first 32 bytes of the WHIR transcript.
+        let transcript_bytes = &proof.combined_whir.proof_narg;
+        let merkle_root = &transcript_bytes[0..32];
+        let mut h = Keccak256::new();
+        h.update(b"plonky2-challenges-v2");
+        h.update(proof.combined_whir.session_name.as_bytes());
+        h.update(merkle_root);
+        for &pi in &proof.standard_proof.public_inputs {
+            h.update(&pi.to_canonical_u64().to_le_bytes());
+        }
 
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.plonk_zs_partial_products_cap);
-    let alphas = challenger.get_n_challenges(num_challenges);
-    challenger.observe_cap::<C::Hasher>(&proof.standard_proof.proof.quotient_polys_cap);
-    let zeta = challenger.get_extension_challenge::<D>();
-    let (zeta_c0, zeta_c1) = ext_to_pair(&zeta);
+        // Squeeze challenges in sequence: betas, gammas, alphas, zeta
+        let mut state = h.finalize().to_vec();
+
+        let mut squeeze_u64 = || -> u64 {
+            let mut h2 = Keccak256::new();
+            h2.update(&state);
+            state = h2.finalize().to_vec();
+            let val = u64::from_le_bytes(state[0..8].try_into().unwrap());
+            val % GL_P
+        };
+
+        let betas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let gammas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let alphas: Vec<u64> = (0..num_challenges).map(|_| squeeze_u64()).collect();
+        let zeta_c0 = squeeze_u64();
+        let zeta_c1 = squeeze_u64();
+        let zeta_c2 = squeeze_u64();
+        (betas, gammas, alphas, zeta_c0, zeta_c1, zeta_c2)
+    };
+    let (keccak_betas, keccak_gammas, keccak_alphas, zeta_c0, zeta_c1, zeta_c2) = keccak_challenges;
 
     // Circuit params
     let selectors_info = &common.selectors_info;
@@ -856,10 +1409,10 @@ where
             "quotientPolys": ext_vec_to_flat(&openings.quotient_polys),
         },
         "challenges": {
-            "plonkBetas": betas.iter().map(|b| b.to_canonical_u64()).collect::<Vec<_>>(),
-            "plonkGammas": gammas.iter().map(|g| g.to_canonical_u64()).collect::<Vec<_>>(),
-            "plonkAlphas": alphas.iter().map(|a| a.to_canonical_u64()).collect::<Vec<_>>(),
-            "plonkZeta": [zeta_c0, zeta_c1],
+            "plonkBetas": keccak_betas,
+            "plonkGammas": keccak_gammas,
+            "plonkAlphas": keccak_alphas,
+            "plonkZeta": [zeta_c0, zeta_c1, zeta_c2],
         },
         "circuitParams": {
             "degreeBits": common.degree_bits(),
@@ -878,6 +1431,65 @@ where
         "publicInputs": proof.standard_proof.public_inputs.iter()
             .map(|f| f.to_canonical_u64())
             .collect::<Vec<_>>(),
+        "batchSizes": proof.batch_sizes,
+        "batchEvalsAtZeta": proof.batch_evals_at_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
+        "batchEvalsAtGZeta": proof.batch_evals_at_g_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
+        "batchEvalsAtGZetaFlat": proof.batch_evals_at_g_zeta.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![base[0].into_bigint().0[0], base[1].into_bigint().0[0], base[2].into_bigint().0[0]]
+        }).collect::<Vec<u64>>(),
+        "intraBatchPolyCounts": proof.intra_batch_poly_counts,
+        "intraBatchEvalsAtZeta": proof.intra_batch_evals_at_zeta.iter().map(|batch_evals| {
+            batch_evals.iter().map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                serde_json::json!({
+                    "c0": base[0].into_bigint().0[0],
+                    "c1": base[1].into_bigint().0[0],
+                    "c2": base[2].into_bigint().0[0],
+                })
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>(),
+        // Flat version for efficient bulk abi.decode (avoids per-element vm.parseJson)
+        "intraBatchEvalsAtZetaFlat": proof.intra_batch_evals_at_zeta.iter().map(|batch_evals| {
+            batch_evals.iter().flat_map(|e| {
+                let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+                vec![
+                    base[0].into_bigint().0[0],
+                    base[1].into_bigint().0[0],
+                    base[2].into_bigint().0[0],
+                ]
+            }).collect::<Vec<u64>>()
+        }).collect::<Vec<_>>(),
+        "batch2EvalsAtGZeta": proof.batch2_evals_at_g_zeta.iter().map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            serde_json::json!({
+                "c0": base[0].into_bigint().0[0],
+                "c1": base[1].into_bigint().0[0],
+                "c2": base[2].into_bigint().0[0],
+            })
+        }).collect::<Vec<_>>(),
+        "batch2EvalsAtGZetaFlat": proof.batch2_evals_at_g_zeta.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![
+                base[0].into_bigint().0[0],
+                base[1].into_bigint().0[0],
+                base[2].into_bigint().0[0],
+            ]
+        }).collect::<Vec<u64>>(),
     })
 }
 
@@ -932,12 +1544,31 @@ fn _gate_config(id: &str) -> Vec<u64> {
     } else if id.contains("ExponentiationGate") {
         vec![extract("num_power_bits").unwrap_or(0)]
     } else if id.contains("CosetInterpolationGate") {
+        use plonky2::field::types::{Field as PlonkyField, PrimeField64};
+        use plonky2::field::goldilocks_field::GoldilocksField as GF;
+        use plonky2::field::interpolation::barycentric_weights;
+
         let subgroup_bits = extract("subgroup_bits").unwrap_or(0);
         let num_points = 1u64 << subgroup_bits;
-        // degree and num_intermediates are computed from config
         let degree = extract("degree").unwrap_or(2);
         let num_intermediates = if degree > 1 { (num_points - 2) / (degree - 1) } else { 0 };
-        vec![subgroup_bits, num_points, num_intermediates, degree]
+
+        // Compute domain (two_adic_subgroup) and barycentric weights
+        let domain: Vec<GF> = GF::two_adic_subgroup(subgroup_bits as usize);
+        let weights: Vec<GF> = barycentric_weights(
+            &domain.iter().map(|&x| (x, GF::ZERO)).collect::<Vec<_>>(),
+        );
+
+        let mut config = vec![subgroup_bits, num_points, num_intermediates, degree];
+        // Append barycentric weights as u64 values
+        for w in &weights {
+            config.push(w.to_canonical_u64());
+        }
+        // Append domain points as u64 values
+        for d in &domain {
+            config.push(d.to_canonical_u64());
+        }
+        config
     } else {
         vec![]
     }
@@ -945,23 +1576,364 @@ fn _gate_config(id: &str) -> Vec<u64> {
 
 /// Map Plonky2 gate ID strings to numeric type IDs for Solidity.
 fn _gate_type_id(id: &str) -> u64 {
+    // SECURITY: More specific gate names must be checked BEFORE less specific ones
+    // to prevent substring false-matches (e.g., "PoseidonMdsGate" before "PoseidonGate").
     if id.contains("NoopGate") { 0 }
     else if id.contains("ConstantGate") { 1 }
     else if id.contains("PublicInputGate") { 2 }
+    else if id.contains("PoseidonMdsGate") { 15 }
     else if id.contains("PoseidonGate") { 3 }
+    else if id.contains("ArithmeticExtensionGate") { 9 }
     else if id.contains("ArithmeticGate") { 4 }
     else if id.contains("BaseSumGate") { 5 }
     else if id.contains("RandomAccessGate") { 6 }
     else if id.contains("ReducingExtensionGate") { 8 }
     else if id.contains("ReducingGate") { 7 }
     else if id.contains("MulExtensionGate") { 10 }
-    else if id.contains("ArithmeticExtensionGate") { 9 }
     else if id.contains("ExponentiationGate") { 11 }
     else if id.contains("CosetInterpolationGate") { 12 }
     else if id.contains("LookupTableGate") { 14 }
     else if id.contains("LookupGate") { 13 }
-    else if id.contains("PoseidonMdsGate") { 15 }
     else { 255 } // Unknown
+}
+
+// ---------------------------------------------------------------------------
+// Unified proof export (combined WHIR + Plonky2 data)
+// ---------------------------------------------------------------------------
+
+/// Export a single unified proof JSON combining WHIR verifier data, circuit
+/// configuration, and polynomial openings.
+///
+/// This merges the data from `export_onchain_data()` and `export_whir_verifier_data()`
+/// into one self-contained JSON structure suitable for the `WhirPlonky2Verifier` contract.
+///
+/// Fields removed from the old format:
+/// - `challenges` (re-derived on-chain from the Merkle root)
+/// - `openings` (old Ext2 format, replaced by flat Ext3 arrays)
+/// - `batchEvalsAtZeta` (replaced by `allOpeningsAtZetaFlat` recomposition)
+/// - `whir_config` (duplicate of `whirParams`)
+pub fn export_unified_proof<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    proof: &WhirPlonky2Proof<F, C, D>,
+    circuit_data: &CircuitData<F, C, D>,
+    config: &WhirWrapConfig,
+) -> serde_json::Value
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    use plonky2::field::types::PrimeField64;
+    use ark_ff::PrimeField as ArkPrimeField;
+
+    let common = &circuit_data.common;
+    let commitment = &proof.combined_whir;
+
+    // -----------------------------------------------------------------------
+    // Helper: Ext3 -> {c0, c1, c2} JSON
+    // -----------------------------------------------------------------------
+    let ext3_json = |e: &Field64_3| -> serde_json::Value {
+        let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+        serde_json::json!({
+            "c0": base[0].into_bigint().0[0],
+            "c1": base[1].into_bigint().0[0],
+            "c2": base[2].into_bigint().0[0],
+        })
+    };
+
+    let ext3_flat = |v: &[Field64_3]| -> Vec<u64> {
+        v.iter().flat_map(|e| {
+            let base: Vec<_> = ark_ff::Field::to_base_prime_field_elements(e).collect();
+            vec![base[0].into_bigint().0[0], base[1].into_bigint().0[0], base[2].into_bigint().0[0]]
+        }).collect()
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.evaluations (WHIR MLE evaluations)
+    // -----------------------------------------------------------------------
+    let evaluations_structured: Vec<serde_json::Value> = commitment.evaluations.iter()
+        .map(|e| ext3_json(e))
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // proof.bridgeZeta — sumcheck bridge for ζ
+    // -----------------------------------------------------------------------
+    let bridge_zeta = match (&commitment.sumcheck_proof, &commitment.zeta, &commitment.claimed_sum, &commitment.eval_point) {
+        (Some(sc_proof), Some(zeta), Some(claimed_sum), Some(eval_pt)) => {
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| ext3_json(e)).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| ext3_json(e)).collect();
+            serde_json::json!({
+                "evalPoint": eval_point_json,
+                "claimedSum": ext3_json(claimed_sum),
+                "sessionName": commitment.session_name,
+                "roundPolys": round_polys,
+                "numRounds": sc_proof.round_polys.len(),
+                "zeta": ext3_json(zeta),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.bridgeGZeta — sumcheck bridge for gζ
+    // -----------------------------------------------------------------------
+    let bridge_g_zeta = match (
+        &commitment.sumcheck_proof_g_zeta,
+        &commitment.g_zeta,
+        &commitment.claimed_sum_g_zeta,
+        &commitment.eval_point_g_zeta,
+    ) {
+        (Some(sc_proof), Some(gz), Some(claimed_sum), Some(eval_pt)) => {
+            let round_polys: Vec<serde_json::Value> = sc_proof.round_polys.iter().map(|g| {
+                let vals: Vec<serde_json::Value> = g.iter().map(|e| ext3_json(e)).collect();
+                serde_json::json!(vals)
+            }).collect();
+            let eval_point_json: Vec<serde_json::Value> = eval_pt.iter().map(|e| ext3_json(e)).collect();
+            serde_json::json!({
+                "evalPoint": eval_point_json,
+                "claimedSum": ext3_json(claimed_sum),
+                "gZeta": ext3_json(gz),
+                "roundPolys": round_polys,
+                "numRounds": sc_proof.round_polys.len(),
+            })
+        }
+        _ => serde_json::json!(null),
+    };
+
+    // -----------------------------------------------------------------------
+    // proof.allOpeningsAtZetaFlat — all per-polynomial evals at ζ (flat c0,c1,c2 per batch)
+    // -----------------------------------------------------------------------
+    let all_openings_at_zeta_flat: Vec<Vec<u64>> = proof.intra_batch_evals_at_zeta.iter()
+        .map(|batch_evals| ext3_flat(batch_evals))
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // proof.batch2OpeningsAtGZetaFlat — per-polynomial evals of batch 2 at gζ
+    // -----------------------------------------------------------------------
+    let batch2_openings_at_g_zeta_flat: Vec<u64> = ext3_flat(&proof.batch2_evals_at_g_zeta);
+
+    // -----------------------------------------------------------------------
+    // proof.batchEvalsAtGZetaFlat — batch-level evaluations at gζ
+    // -----------------------------------------------------------------------
+    let batch_evals_at_g_zeta_flat: Vec<u64> = ext3_flat(&proof.batch_evals_at_g_zeta);
+
+    // -----------------------------------------------------------------------
+    // circuitConfig
+    // -----------------------------------------------------------------------
+    let selectors_info = &common.selectors_info;
+
+    let gate_infos: Vec<serde_json::Value> = common.gates.iter().enumerate().map(|(i, gate)| {
+        let sel_idx = selectors_info.selector_indices[i];
+        let group = &selectors_info.groups[sel_idx];
+        let id = gate.0.id();
+        serde_json::json!({
+            "gateType": _gate_type_id(&id),
+            "selectorIndex": sel_idx,
+            "groupStart": group.start,
+            "groupEnd": group.end,
+            "rowInGroup": i,
+            "numConstraints": gate.0.num_constraints(),
+            "gateConfig": _gate_config(&id),
+        })
+    }).collect();
+
+    let k_is: Vec<u64> = common.k_is.iter().map(|k| k.to_canonical_u64()).collect();
+
+    // -----------------------------------------------------------------------
+    // whirParams — computed from WHIR config
+    // -----------------------------------------------------------------------
+    let whir_params = {
+        let poly_size = 1usize << commitment.num_variables;
+        let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+        use ark_ff::FftField;
+        let gl_root_of_unity = |n: usize| -> u64 {
+            let g: Field64 = Field64::get_root_of_unity(n as u64)
+                .expect("No root of unity for requested size");
+            ark_ff::PrimeField::into_bigint(g).0[0]
+        };
+        let log2_of = |mut n: usize| -> usize {
+            let mut d = 0;
+            while n > 1 { n >>= 1; d += 1; }
+            d
+        };
+
+        let num_rounds = params.round_configs.len();
+        let initial_codeword_length = params.initial_committer.codeword_length;
+        let initial_mml = params.initial_committer.masked_message_length();
+        let initial_coset_size = {
+            let mut cs = initial_mml.next_power_of_two();
+            while initial_codeword_length % cs != 0 { cs *= 2; }
+            cs
+        };
+
+        let rounds_json: Vec<serde_json::Value> = params.round_configs.iter().map(|rc| {
+            let cl = rc.irs_committer.codeword_length;
+            let mml = rc.irs_committer.masked_message_length();
+            let mut cs = mml.next_power_of_two();
+            while cl % cs != 0 { cs *= 2; }
+            serde_json::json!({
+                "codeword_length": cl,
+                "merkle_depth": log2_of(cl),
+                "domain_generator": gl_root_of_unity(cl),
+                "in_domain_samples": rc.irs_committer.in_domain_samples,
+                "out_domain_samples": rc.irs_committer.out_domain_samples,
+                "sumcheck_rounds": rc.sumcheck.num_rounds,
+                "interleaving_depth": rc.irs_committer.interleaving_depth,
+                "coset_size": cs,
+                "num_cosets": cl / cs,
+                "num_variables": rc.initial_num_variables(),
+            })
+        }).collect();
+
+        serde_json::json!({
+            "num_variables": commitment.num_variables,
+            "folding_factor": config.params.folding_factor,
+            "num_vectors": params.initial_committer.num_vectors,
+            "out_domain_samples": params.initial_committer.out_domain_samples,
+            "in_domain_samples": params.initial_committer.in_domain_samples,
+            "initial_sumcheck_rounds": params.initial_sumcheck.num_rounds,
+            "num_rounds": num_rounds,
+            "final_sumcheck_rounds": params.final_sumcheck.num_rounds,
+            "final_size": params.final_sumcheck.initial_size,
+            "initial_codeword_length": initial_codeword_length,
+            "initial_merkle_depth": log2_of(initial_codeword_length),
+            "initial_domain_generator": gl_root_of_unity(initial_codeword_length),
+            "initial_interleaving_depth": params.initial_committer.interleaving_depth,
+            "initial_num_variables": params.initial_num_variables(),
+            "initial_coset_size": initial_coset_size,
+            "initial_num_cosets": initial_codeword_length / initial_coset_size,
+            "rounds": rounds_json,
+        })
+    };
+
+    // -----------------------------------------------------------------------
+    // WHIR protocol/session IDs (for verifyWhirProof)
+    // -----------------------------------------------------------------------
+    let (protocol_id, session_id) = {
+        let poly_size = 1usize << commitment.num_variables;
+        let params = InternalWhirConfig::<Basefield<Field64_3>>::new(poly_size, &config.params);
+
+        use sha3::{Digest, Keccak256};
+        let mut config_bytes = Vec::new();
+        ciborium::into_writer(&params, &mut config_bytes).expect("CBOR serialization failed");
+        let first: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x00]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let second: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update([0x01]);
+            h.update(&config_bytes);
+            h.finalize().into()
+        };
+        let mut pid = [0u8; 64];
+        pid[..32].copy_from_slice(&first);
+        pid[32..].copy_from_slice(&second);
+
+        let mut session_bytes = Vec::new();
+        ciborium::into_writer(&commitment.session_name, &mut session_bytes)
+            .expect("CBOR serialization failed");
+        let mut h = Keccak256::new();
+        h.update(&session_bytes);
+        let sid: [u8; 32] = h.finalize().into();
+
+        (format!("0x{}", hex::encode(pid)), format!("0x{}", hex::encode(sid)))
+    };
+
+    // -----------------------------------------------------------------------
+    // Evaluation point for WHIR (sumcheck-derived r, or canonical)
+    // -----------------------------------------------------------------------
+    let eval_point: Vec<serde_json::Value> = match &commitment.eval_point {
+        Some(p) => p.iter().map(|e| ext3_json(e)).collect(),
+        None => (0..commitment.num_variables)
+            .map(|i| serde_json::json!({"c0": i + 1, "c1": 0, "c2": 0}))
+            .collect(),
+    };
+
+    let eval_point2: Vec<serde_json::Value> = match &commitment.eval_point_g_zeta {
+        Some(p) => p.iter().map(|e| ext3_json(e)).collect(),
+        None => vec![],
+    };
+
+    // -----------------------------------------------------------------------
+    // Compute constants_sigmas hash for VK binding (batch 0 commitment)
+    // -----------------------------------------------------------------------
+    let batch0_coeffs = polys_to_whir_field(
+        &circuit_data.prover_only.constants_sigmas_commitment.polynomials,
+    );
+    let batch0_hash_hex = {
+        use sha3::{Digest, Keccak256};
+        let mut bytes = Vec::with_capacity(batch0_coeffs.len() * 8);
+        for c in &batch0_coeffs {
+            bytes.extend_from_slice(&c.into_bigint().0[0].to_le_bytes());
+        }
+        let hash = Keccak256::digest(&bytes);
+        format!("0x{}", hex::encode(hash))
+    };
+    let batch0_coeffs_u64: Vec<u64> = batch0_coeffs
+        .iter()
+        .map(|c| c.into_bigint().0[0])
+        .collect();
+
+    // -----------------------------------------------------------------------
+    // Assemble unified JSON
+    // -----------------------------------------------------------------------
+    // Split into VK (verifying key) and proof data
+    let vk = serde_json::json!({
+        "circuitConfig": {
+            "degreeBits": common.degree_bits(),
+            "numChallenges": common.config.num_challenges,
+            "numRoutedWires": common.config.num_routed_wires,
+            "quotientDegreeFactor": common.quotient_degree_factor,
+            "numPartialProducts": common.num_partial_products,
+            "numGateConstraints": common.num_gate_constraints,
+            "numSelectors": selectors_info.num_selectors(),
+            "numLookupSelectors": common.num_lookup_selectors,
+            "batchSizes": proof.batch_sizes,
+            "intraBatchPolyCounts": proof.intra_batch_poly_counts,
+            "gates": gate_infos,
+            "permutation": {
+                "kIs": k_is,
+            },
+            "sessionName": commitment.session_name,
+            "constantsSigmasHash": batch0_hash_hex,
+        },
+        "whirParams": whir_params,
+        "protocolId": protocol_id,
+        "sessionId": session_id,
+        "instance": "0x",
+    });
+
+    let proof_data = serde_json::json!({
+        "transcript": format!("0x{}", hex::encode(&commitment.proof_narg)),
+        "hints": format!("0x{}", hex::encode(&commitment.proof_hints)),
+        "evaluations": evaluations_structured,
+        "evaluationPoint": eval_point,
+        "evaluationPoint2": eval_point2,
+        "bridgeZeta": bridge_zeta,
+        "bridgeGZeta": bridge_g_zeta,
+        "allOpeningsAtZetaFlat": all_openings_at_zeta_flat,
+        "batch2OpeningsAtGZetaFlat": batch2_openings_at_g_zeta_flat,
+        "batchEvalsAtGZetaFlat": batch_evals_at_g_zeta_flat,
+        "publicInputs": proof.standard_proof.public_inputs.iter()
+            .map(|f| f.to_canonical_u64())
+            .collect::<Vec<_>>(),
+        "batch0Coefficients": batch0_coeffs_u64,
+    });
+
+    // Return combined (for backward compat) with clear separation
+    serde_json::json!({
+        "vk": vk,
+        "proof": proof_data,
+    })
 }
 
 // ---------------------------------------------------------------------------

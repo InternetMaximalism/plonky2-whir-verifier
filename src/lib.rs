@@ -21,3 +21,6 @@ pub mod wrapper;
 
 #[cfg(feature = "whir")]
 pub mod prover;
+
+#[cfg(feature = "whir")]
+pub mod sumcheck;
